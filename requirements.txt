@@ -1,0 +1,12 @@
+flask==3.1.1
+flask-cors==5.0.1
+numpy==2.2.6
+opencv-python-headless==4.11.0.86
+scipy==1.15.3
+scikit-learn==1.6.1
+scikit-image==0.25.2
+matplotlib==3.10.3
+Pillow==11.2.1
+spectral==0.24
+reportlab==4.4.0
+gunicorn==23.0.0

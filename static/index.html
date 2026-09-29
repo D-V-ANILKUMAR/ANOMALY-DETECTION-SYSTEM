@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Anomaly Detection System - Target Detection by Optimizing Anomaly Detection in Hyperspectral and RGB Image Processing using AI/ML">
+    <title>Anomaly Detection System | Hyperspectral & RGB Image Analysis</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔬</text></svg>">
+</head>
+<body>
+
+    <!-- ─── Header ──────────────────────────────────────────────────── -->
+    <header class="app-header">
+        <div class="header-content">
+            <div class="logo-section">
+                <div class="logo-icon">🔬</div>
+                <div class="logo-text">
+                    <h1>Anomaly Detection System</h1>
+                    <p>Hyperspectral & RGB Image Processing</p>
+                </div>
+            </div>
+            <div class="header-status">
+                <span class="status-dot"></span>
+                System Ready
+            </div>
+        </div>
+    </header>
+
+    <!-- ─── Hero ────────────────────────────────────────────────────── -->
+    <div class="app-container">
+        <section class="hero-section">
+            <div class="hero-badge">
+                <span class="hero-badge-dot"></span>
+                AI/ML Powered Detection
+            </div>
+            <h2 class="hero-title">
+                Detect Anomalies with<br>
+                <span class="gradient-text">Precision & Intelligence</span>
+            </h2>
+            <p class="hero-subtitle">
+                Upload RGB or hyperspectral images and let our statistical analysis engine identify 
+                unusual patterns, regions, and spectral signatures — no training dataset required.
+            </p>
+        </section>
+
+        <!-- ─── Main Content ────────────────────────────────────────── -->
+        <main class="main-content">
+            
+            <!-- ─── Sidebar: Upload & Controls ──────────────────────── -->
+            <aside class="sidebar-panel">
+                <!-- Upload Panel -->
+                <div class="panel" style="margin-bottom: 20px;">
+                    <div class="panel-header">
+                        <div class="panel-header-icon">📤</div>
+                        <span class="panel-title">Upload Image</span>
+                    </div>
+                    <div class="panel-body">
+                        <div class="upload-zone" id="uploadZone">
+                            <span class="upload-icon">🖼️</span>
+                            <div class="upload-text">Drop your image here</div>
+                            <div class="upload-hint">or click to browse • PNG, JPG, TIFF, NPY, HDR</div>
+                            <input type="file" id="fileInput" accept=".png,.jpg,.jpeg,.bmp,.tiff,.tif,.npy,.hdr,.mat" hidden>
+                        </div>
+                        <div class="file-info" id="fileInfo">
+                            <span>📎</span>
+                            <span class="file-name" id="fileName"></span>
+                            <span class="file-remove" id="fileRemove" title="Remove file">✕</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Settings Panel -->
+                <div class="panel" style="margin-bottom: 20px;">
+                    <div class="panel-header">
+                        <div class="panel-header-icon">⚙️</div>
+                        <span class="panel-title">Detection Settings</span>
+                    </div>
+                    <div class="panel-body">
+                        <div class="form-group">
+                            <label class="form-label" for="imageType">Image Type</label>
+                            <select class="form-select" id="imageType">
+                                <option value="rgb">RGB Image (PNG, JPG, BMP, TIFF)</option>
+                                <option value="hyperspectral">Hyperspectral Image (NPY, HDR, TIFF)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group" id="methodGroup">
+                            <label class="form-label" for="detectionMethod">Detection Method</label>
+                            <select class="form-select" id="detectionMethod">
+                                <option value="mahalanobis">Mahalanobis Distance (Robust)</option>
+                                <option value="statistical">Statistical Deviation (Z-Score)</option>
+                            </select>
+                            <div class="method-info" id="methodInfo">
+                                <span class="method-info-icon">💡</span>
+                                <span id="methodInfoText">Uses robust covariance estimation (MCD) to compute Mahalanobis distance. Best for detecting pixels that deviate from the global distribution.</span>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Anomaly Threshold</label>
+                            <div class="threshold-slider-wrapper">
+                                <input type="range" class="threshold-slider" id="thresholdSlider" min="80" max="99.5" step="0.5" value="95">
+                                <span class="threshold-value" id="thresholdValue">95%</span>
+                            </div>
+                        </div>
+
+                        <button class="btn btn-primary" id="detectBtn" disabled>
+                            <span class="spinner"></span>
+                            <span class="btn-text">🚀 Run Anomaly Detection</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Quick Stats (shown after detection) -->
+                <div class="panel" id="quickStatsPanel" style="display: none;">
+                    <div class="panel-header">
+                        <div class="panel-header-icon">📊</div>
+                        <span class="panel-title">Quick Summary</span>
+                    </div>
+                    <div class="panel-body">
+                        <div style="display: flex; flex-direction: column; gap: 12px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span style="font-size: 0.8rem; color: var(--text-tertiary);">Anomaly %</span>
+                                <span id="quickAnomalyPct" style="font-family: 'JetBrains Mono'; font-weight: 700; color: var(--accent-rose); font-size: 1.1rem;">—</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span style="font-size: 0.8rem; color: var(--text-tertiary);">Regions Found</span>
+                                <span id="quickRegions" style="font-family: 'JetBrains Mono'; font-weight: 700; color: var(--primary-300); font-size: 1.1rem;">—</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span style="font-size: 0.8rem; color: var(--text-tertiary);">Dimensions</span>
+                                <span id="quickDimensions" style="font-family: 'JetBrains Mono'; font-weight: 600; color: var(--text-secondary); font-size: 0.85rem;">—</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- ─── Results Area ────────────────────────────────────── -->
+            <div class="results-area">
+                
+                <!-- Empty State -->
+                <div class="panel" id="emptyState">
+                    <div class="empty-state">
+                        <div class="empty-state-icon">🛰️</div>
+                        <div class="empty-state-title">Ready to Analyze</div>
+                        <div class="empty-state-text">
+                            Upload an RGB or hyperspectral image to begin anomaly detection. 
+                            The system will analyze pixel patterns and highlight unusual regions.
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Results (hidden initially) -->
+                <div id="resultsContainer" style="display: none;">
+                    
+                    <!-- Stats Grid -->
+                    <div class="stats-grid stagger-children" id="statsGrid">
+                        <div class="stat-card">
+                            <div class="stat-label">Total Pixels</div>
+                            <div class="stat-value" id="statTotalPixels">—</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Anomalous Pixels</div>
+                            <div class="stat-value danger" id="statAnomalyPixels">—</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Anomaly Rate</div>
+                            <div class="stat-value danger" id="statAnomalyPct">—</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Detected Regions</div>
+                            <div class="stat-value success" id="statRegions">—</div>
+                        </div>
+                    </div>
+
+                    <!-- Visualization Panel -->
+                    <div class="panel">
+                        <div class="panel-header" style="flex-wrap: wrap; gap: 12px;">
+                            <div class="panel-header-icon">🖥️</div>
+                            <span class="panel-title">Visualization</span>
+                            <div class="visualization-tabs" style="margin-left: auto;">
+                                <button class="viz-tab active" data-view="original">Original</button>
+                                <button class="viz-tab" data-view="heatmap">Heatmap</button>
+                                <button class="viz-tab" data-view="overlay">Overlay</button>
+                                <button class="viz-tab" data-view="highlighted">Highlighted</button>
+                                <button class="viz-tab" data-view="mask">Mask</button>
+                            </div>
+                        </div>
+                        <div class="viz-content" id="vizContent">
+                            <img class="viz-image active" id="imgOriginal" alt="Original image">
+                            <img class="viz-image" id="imgHeatmap" alt="Anomaly heatmap">
+                            <img class="viz-image" id="imgOverlay" alt="Overlay visualization">
+                            <img class="viz-image" id="imgHighlighted" alt="Highlighted anomalies">
+                            <img class="viz-image" id="imgMask" alt="Anomaly mask">
+                        </div>
+                    </div>
+
+                    <!-- Detailed Stats Panel -->
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div class="panel-header-icon">📈</div>
+                            <span class="panel-title">Detailed Statistics</span>
+                        </div>
+                        <div class="panel-body">
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;">
+                                <div>
+                                    <div class="stat-label">Min Score</div>
+                                    <div id="statMinScore" style="font-family: 'JetBrains Mono'; font-size: 1rem; font-weight: 600; color: var(--text-primary);">—</div>
+                                </div>
+                                <div>
+                                    <div class="stat-label">Max Score</div>
+                                    <div id="statMaxScore" style="font-family: 'JetBrains Mono'; font-size: 1rem; font-weight: 600; color: var(--text-primary);">—</div>
+                                </div>
+                                <div>
+                                    <div class="stat-label">Mean Score</div>
+                                    <div id="statMeanScore" style="font-family: 'JetBrains Mono'; font-size: 1rem; font-weight: 600; color: var(--text-primary);">—</div>
+                                </div>
+                                <div>
+                                    <div class="stat-label">Std Deviation</div>
+                                    <div id="statStdScore" style="font-family: 'JetBrains Mono'; font-size: 1rem; font-weight: 600; color: var(--text-primary);">—</div>
+                                </div>
+                                <div>
+                                    <div class="stat-label">Threshold Value</div>
+                                    <div id="statThresholdVal" style="font-family: 'JetBrains Mono'; font-size: 1rem; font-weight: 600; color: var(--primary-300);">—</div>
+                                </div>
+                                <div>
+                                    <div class="stat-label">Detection Method</div>
+                                    <div id="statMethod" style="font-size: 0.9rem; font-weight: 600; color: var(--text-primary);">—</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="actions-bar">
+                        <button class="btn btn-secondary" id="adjustThresholdBtn">
+                            🎚️ Adjust & Re-detect
+                        </button>
+                        <button class="btn btn-success" id="downloadReportBtn">
+                            📄 Download Report (PDF)
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- ─── Processing Overlay ──────────────────────────────────────── -->
+    <div class="processing-overlay" id="processingOverlay">
+        <div class="processing-spinner"></div>
+        <div class="processing-text" id="processingText">Analyzing Image...</div>
+        <div class="processing-subtext">This may take a moment depending on image size</div>
+        <div class="progress-steps" id="progressSteps">
+            <div class="progress-step" data-step="upload">
+                <span class="progress-step-icon">1</span>
+                <span>Uploading image</span>
+            </div>
+            <div class="progress-step" data-step="preprocess">
+                <span class="progress-step-icon">2</span>
+                <span>Preprocessing & feature extraction</span>
+            </div>
+            <div class="progress-step" data-step="detect">
+                <span class="progress-step-icon">3</span>
+                <span>Running anomaly detection</span>
+            </div>
+            <div class="progress-step" data-step="visualize">
+                <span class="progress-step-icon">4</span>
+                <span>Generating visualizations</span>
+            </div>
+            <div class="progress-step" data-step="complete">
+                <span class="progress-step-icon">5</span>
+                <span>Preparing results</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- ─── Toast Container ─────────────────────────────────────────── -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
