@@ -533,8 +533,8 @@ def detect_anomalies():
             if image is None:
                 return jsonify({'error': 'Failed to read image. Please upload a valid RGB image.'}), 400
             
-            # Resize if too large (for performance)
-            max_dim = 1024
+            # Resize if too large (for performance and memory)
+            max_dim = 512
             h, w = image.shape[:2]
             if max(h, w) > max_dim:
                 scale = max_dim / max(h, w)
