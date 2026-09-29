@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: anomaly-detection-system
+    runtime: python
+    repo: https://github.com/D-V-ANILKUMAR/ANOMALY-DETECTION-SYSTEM.git
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.12"
+      - key: FLASK_ENV
+        value: production
+      - key: FLASK_DEBUG
+        value: "0"
+      - key: MAX_UPLOAD_SIZE_MB
+        value: "50"
+      - key: PORT
+        value: "10000"
+      - key: WORKERS
+        value: "2"
+      - key: TIMEOUT
+        value: "120"
+      - key: MPLBACKEND
+        value: Agg

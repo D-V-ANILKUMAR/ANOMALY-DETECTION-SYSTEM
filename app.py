@@ -748,11 +748,13 @@ def download_report(result_id):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_DEBUG', '1') == '1'
     print("=" * 60)
     print("  Anomaly Detection System")
     print("  Target Detection by Optimizing Anomaly Detection")
     print("  in Hyperspectral and RGB Image Processing using AI/ML")
     print("=" * 60)
-    print(f"  Server: http://localhost:5000")
+    print(f"  Server: http://localhost:{port}")
     print("=" * 60)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=debug, host='0.0.0.0', port=port)
