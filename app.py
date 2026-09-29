@@ -22,6 +22,10 @@ import cv2
 from PIL import Image
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
 from sklearn.covariance import EmpiricalCovariance, MinCovDet

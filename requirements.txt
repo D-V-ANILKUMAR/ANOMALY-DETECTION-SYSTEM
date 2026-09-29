@@ -10,3 +10,4 @@ Pillow==11.2.1
 spectral==0.24
 reportlab==4.4.0
 gunicorn==23.0.0
+python-dotenv==1.0.1
