@@ -48,7 +48,7 @@ import matplotlib.colors as mcolors
 # 4  = airplane (fixed-wing UAV proxy)
 # 14 = bird     (small UAV / quadcopter proxy – often confused with drones in COCO)
 YOLO_HUMAN_CLASS_ID    = 0           # person
-YOLO_DRONE_CLASS_IDS   = {4, 14}     # airplane, bird – drone proxies in COCO
+YOLO_DRONE_CLASS_IDS   = {4}         # airplane (fixed-wing / UAV proxy)
 YOLO_VEHICLE_CLASS_IDS = {2, 3, 5, 7} # car, motorcycle, bus, truck
 
 # All target class IDs combined
@@ -61,6 +61,7 @@ COLOUR_HUMAN   = (0,   0,   255)   # Red     – human
 COLOUR_DRONE   = (0, 165,   255)   # Orange  – drone
 COLOUR_VEHICLE = (255, 200,   0)   # Cyan    – vehicle
 COLOUR_WEAPON  = (255,   0, 200)   # Magenta – weapon / gun
+COLOUR_ANOMALY = (0, 255, 255)     # Yellow  – anomaly
 COLOUR_BORDER  = (255, 255, 255)   # White   – label border
 
 _yolo_model        = None   # lazy-loaded YOLOv8s (COCO) singleton
@@ -74,10 +75,9 @@ def _get_yolo_model():
         try:
             # pyrefly: ignore [missing-import]
             from ultralytics import YOLO
-            # Use nano model on deployment – 4x less RAM than 'small',
-            # still accurate for humans, vehicles, drones at imgsz=640
-            _yolo_model = YOLO('yolov8n.pt')
-            print("[YOLO] YOLOv8n model loaded successfully.")
+            # Switched to the small model ('yolov8s.pt') for best accuracy as requested.
+            _yolo_model = YOLO('yolov8s.pt')
+            print("[YOLO] YOLOv8s model loaded successfully.")
         except Exception as e:
             print(f"[YOLO] Could not load YOLOv8 model: {e}. Falling back to statistical detection.")
             _yolo_model = False   # sentinel – don't retry
@@ -254,13 +254,10 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
                 return True          # new box is mostly INSIDE existing box
         return False
 
-    # Focus on top 55% of image where distant objects live
-    upper_h = int(h * 0.55)
-    upper_w = w
-
-    # Each tile = ~62.5% width, full upper height → effective 2× zoom
-    t_h = upper_h
-    t_w = upper_w // 2 + upper_w // 8
+    # Full-image 2x2 overlapping grid (effective 2x zoom on all quadrants)
+    # This is critical for aerial/drone imagery where small targets can be anywhere.
+    t_h = h // 2 + h // 8
+    t_w = w // 2 + w // 8
 
     # On low-memory deployments (e.g. Render free 512MB), skip Phase-2 zoom
     # tiles to avoid OOM. Each tile = 1 full YOLO forward pass = ~200MB spike.
@@ -268,10 +265,11 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
     _disable_phase2 = os.environ.get('DISABLE_PHASE2', '0') == '1'
 
     zoom_tiles = [] if _disable_phase2 else [
-        (0,               0, t_w,      t_h),   # upper-left
-        (upper_w - t_w,   0, upper_w, t_h),    # upper-right
-        ((upper_w - t_w) // 2, 0,
-         (upper_w - t_w) // 2 + t_w, t_h),    # centre
+        (0,               0,               t_w, t_h),       # top-left
+        (w - t_w,         0,               w,   t_h),       # top-right
+        (0,               h - t_h,         t_w, h),         # bottom-left
+        (w - t_w,         h - t_h,         w,   h),         # bottom-right
+        ((w - t_w) // 2,  (h - t_h) // 2,  (w - t_w) // 2 + t_w, (h - t_h) // 2 + t_h), # centre
     ]
     if _disable_phase2:
         print("[YOLO] Phase-2 zoom tiles DISABLED (low-memory mode)")
@@ -307,7 +305,8 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
         tile_img = image_bgr[y0:y1e, x0:x1e]
         if tile_img.size == 0:
             continue
-        tile_dets = _run_yolo(tile_img, ox=x0, oy=y0, conf=0.10)
+        # Use realistic confidence (0.20) to detect small objects without noise triggers
+        tile_dets = _run_yolo(tile_img, ox=x0, oy=y0, conf=0.20)
         for det in tile_dets:
             _merge_raw(det, phase2_raw)
 
@@ -324,7 +323,7 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
                 (bg_strip.shape[1] * zoom_factor, bg_strip.shape[0] * zoom_factor),
                 interpolation=cv2.INTER_LANCZOS4
             )
-            bg_dets_raw = _run_yolo(bg_zoom, ox=0, oy=0, conf=0.10)
+            bg_dets_raw = _run_yolo(bg_zoom, ox=0, oy=0, conf=0.20)
             # Remap from zoomed coords back to full-image coords
             for det in bg_dets_raw:
                 x1z, y1z, x2z, y2z = det['box']
@@ -339,10 +338,7 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
                 _merge_raw(det, phase2_raw)
 
     # ── Filter and deduplicate Phase-2 candidates ─────────────────────────────
-    # Accept a detection if:
-    #   a) area >= 200px²  (a real object at close range), OR
-    #   b) votes >= 2      (same location confirmed by 2+ independent tile passes)
-    # Single-tile tiny boxes (pure noise) are rejected.
+    # Accept a detection if conf >= 0.20 and area >= 150 px²
     phase2_raw.sort(key=lambda d: d['conf'], reverse=True)
     phase2_dets = []
     for det in phase2_raw:
@@ -351,9 +347,7 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
         area   = bw * bh
         votes  = det.get('votes', 1)
 
-        if area < 200 and votes < 2:
-            print(f"[YOLO] Phase-2 SKIP single-tile noise "
-                  f"{bw}×{bh}px area={area} votes={votes} {det['sublabel']}")
+        if area < 150 or det['conf'] < 0.20:
             continue
 
         if not _is_duplicate(det, phase2_dets):
@@ -368,75 +362,6 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
         else:
             print(f"[YOLO] Phase-2 SUPPRESS (dup of Phase-1): "
                   f"{det['sublabel']} conf={det['conf']:.3f} box={det['box']}")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PHASE 3A – Heuristic weapon relabeling (no extra model needed)
-    #
-    # COCO-YOLO has no gun/weapon class.  It commonly misdetects rifles as:
-    #   • Drone / airplane (class 4)  – barrel+scope looks like a fuselage
-    #   • Bird           (class 14)  – same elongated shape
-    #
-    # Heuristic: reclassify a Drone/Bird detection as "Weapon (Suspected)" if:
-    #   1. Confidence < 45 %  (low-confidence → model is unsure)
-    #   2. Bounding box aspect ratio > 2.5  (elongated: guns are long & thin)
-    #   3. Box centre is in the lower 80 % of image  (ground level, not sky)
-    # ─────────────────────────────────────────────────────────────────────────
-    relabeled = []
-    remaining = []
-    for det in detections:
-        bx1, by1, bx2, by2 = det['box']
-        bw = max(1, bx2 - bx1)
-        bh = max(1, by2 - by1)
-        aspect = max(bw / bh, bh / bw)          # elongation ratio
-        cy = (by1 + by2) / 2                    # vertical centre (0=top)
-        is_ground_level = cy > h * 0.20          # not in top 20 % (sky)
-
-        if (det['label'] in ['Drone', 'Vehicle'] and
-                det['conf'] < 0.45 and
-                aspect > 1.3 and
-                is_ground_level):
-            print(f"[HEURISTIC] Reclassifying {det['sublabel']} conf={det['conf']:.3f} "
-                  f"aspect={aspect:.1f} → Weapon (Suspected)")
-            relabeled.append({
-                **det,
-                'label'   : 'Weapon',
-                'sublabel': 'Weapon (Suspected)',
-            })
-        else:
-            remaining.append(det)
-
-    # Merge fragmented/duplicate weapon detections from different YOLO phases
-    # Two weapon boxes are merged if they overlap (IoU > 0.05) OR one is mostly
-    # inside the other (IoS > 0.3). Merged box = union of both boxes.
-    def _box_union(a, b):
-        return (min(a[0], b[0]), min(a[1], b[1]),
-                max(a[2], b[2]), max(a[3], b[3]))
-
-    def _weapon_overlap(a, b, pad=80):
-        """True if boxes overlap or are within `pad` pixels of each other."""
-        ax1, ay1, ax2, ay2 = a[0]-pad, a[1]-pad, a[2]+pad, a[3]+pad
-        bx1, by1, bx2, by2 = b[0]-pad, b[1]-pad, b[2]+pad, b[3]+pad
-        inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
-        inter_h = max(0, min(ay2, by2) - max(ay1, by1))
-        return inter_w * inter_h > 0
-
-
-    merged_relabeled = []
-    while relabeled:
-        curr = relabeled.pop(0)
-        merged = True
-        while merged:
-            merged = False
-            for i, other in enumerate(relabeled):
-                if _weapon_overlap(curr['box'], other['box']):
-                    curr['box']  = _box_union(curr['box'], other['box'])
-                    curr['conf'] = max(curr['conf'], other['conf'])
-                    relabeled.pop(i)
-                    merged = True
-                    break
-        merged_relabeled.append(curr)
-
-    detections = remaining + merged_relabeled
 
     # ─────────────────────────────────────────────────────────────────────────
     # PHASE 3B – Dedicated weapon detection model (optional, if downloadable)
@@ -493,6 +418,23 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
             cleaned.append(det)
         detections = cleaned
 
+    # ── PHASE 4 – Preserve Specific Target Sublabels & Final NMS ─────────────
+    # Do NOT overwrite specific recognized targets (e.g. Car, Truck, Human, Drone)
+    # with generic 'Anomaly' if confidence is reasonable (>= 0.15).
+    # Only label as 'Anomaly' if confidence is below 0.15 or class is unclassified.
+    for det in detections:
+        if det['conf'] < 0.15 and det['label'] not in ('Weapon', 'Vehicle'):
+            det['label'] = 'Anomaly'
+            det['sublabel'] = 'Anomaly'
+
+    # Final global NMS pass to eliminate any remaining duplicate or overlapping boxes
+    detections.sort(key=lambda d: d['conf'], reverse=True)
+    final_dets = []
+    for det in detections:
+        if not any(_iou(det['box'], k['box']) > 0.35 or _ios(det['box'], k['box']) > 0.55 for k in final_dets):
+            final_dets.append(det)
+
+    detections = final_dets
     print(f"[YOLO] Found {len(detections)} target(s) total: "
           f"{[d['sublabel'] for d in detections]}")
     return detections
@@ -533,7 +475,11 @@ def build_detection_score_map(scores_stat, detections, image_shape):
 def draw_detection_boxes(image_bgr, detections):
     """
     Render coloured bounding boxes + confidence labels on the image.
-    Colours: Red=Human | Orange=Drone | Cyan=Vehicle | Magenta=Weapon
+    Colours: Red=Human | Orange=Drone | Cyan=Vehicle | Magenta=Weapon | Yellow=Anomaly
+    Features:
+    - Smart label badge placement to avoid label overlapping
+    - High-contrast text outlines
+    - Dark outer border for bounding box pop
     Returns (annotated_image, num_humans, num_drones, num_vehicles, num_weapons).
     """
     output = image_bgr.copy()
@@ -542,7 +488,32 @@ def draw_detection_boxes(image_bgr, detections):
     num_vehicles = 0
     num_weapons  = 0
 
-    for det in detections:
+    if not detections:
+        return output, 0, 0, 0, 0
+
+    img_h, img_w = output.shape[:2]
+
+    # Final NMS deduplication pass to ensure zero duplicate boxes are drawn
+    def _iou_local(a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter == 0: return 0.0
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        return inter / (area_a + area_b - inter)
+
+    sorted_dets = sorted(detections, key=lambda d: d.get('conf', 0), reverse=True)
+    unique_dets = []
+    for d in sorted_dets:
+        if not any(_iou_local(d['box'], u['box']) > 0.35 for u in unique_dets):
+            unique_dets.append(d)
+
+    placed_labels = []  # track (lx1, ly1, lx2, ly2) of drawn label badges
+
+    for det in unique_dets:
         x1, y1, x2, y2 = det['box']
         label    = det['label']
         sublabel = det.get('sublabel', label)
@@ -557,32 +528,67 @@ def draw_detection_boxes(image_bgr, detections):
         elif label == 'Weapon':
             colour = COLOUR_WEAPON
             num_weapons += 1
+        elif label == 'Anomaly':
+            colour = COLOUR_ANOMALY
         else:  # Vehicle
             colour = COLOUR_VEHICLE
             num_vehicles += 1
-
-        # Thick bounding box
-        cv2.rectangle(output, (x1, y1), (x2, y2), colour, 3)
-
-        # Label text: show sublabel (e.g. "Car", "Truck", "Rifle") + confidence
-        text = f"{sublabel} {conf:.0%}"
-        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        label_y1 = max(y1 - th - baseline - 6, 0)
-        label_y2 = max(y1, th + baseline + 6)
-        cv2.rectangle(output, (x1, label_y1), (x1 + tw + 8, label_y2), colour, -1)
-
-        # White text
-        cv2.putText(
-            output, text,
-            (x1 + 4, label_y2 - baseline - 2),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-            COLOUR_BORDER, 2, cv2.LINE_AA
-        )
 
         # Semi-transparent fill inside box
         overlay = output.copy()
         cv2.rectangle(overlay, (x1, y1), (x2, y2), colour, -1)
         cv2.addWeighted(overlay, 0.15, output, 0.85, 0, output)
+
+        # Thick bounding box with dark border shadow for high contrast pop
+        cv2.rectangle(output, (x1-1, y1-1), (x2+1, y2+1), (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.rectangle(output, (x1, y1), (x2, y2), colour, 3, cv2.LINE_AA)
+
+        # Label text: show sublabel (e.g. "Car", "Truck", "Human") + confidence %
+        text = f" {sublabel} {conf:.0%} "
+        font_scale = 0.55
+        thickness = 2
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+
+        label_w = tw + 8
+        label_h = th + baseline + 8
+
+        # Target label placement: above top-left of box
+        lx1 = max(0, min(x1, img_w - label_w))
+        ly1 = y1 - label_h
+        if ly1 < 0:
+            ly1 = y1 + 4  # inside box if near top edge
+
+        # Adjust position if it overlaps an existing label badge
+        for _ in range(5):
+            ly2 = ly1 + label_h
+            lx2 = lx1 + label_w
+            overlap = False
+            for (px1, py1, px2, py2) in placed_labels:
+                if not (lx2 < px1 or lx1 > px2 or ly2 < py1 or ly1 > py2):
+                    overlap = True
+                    ly1 = py2 + 2  # shift down below overlapping badge
+                    break
+            if not overlap:
+                break
+
+        ly2 = ly1 + label_h
+        lx2 = lx1 + label_w
+        placed_labels.append((lx1, ly1, lx2, ly2))
+
+        # Badge background rectangle with dark outline border
+        cv2.rectangle(output, (lx1 - 1, ly1 - 1), (lx2 + 1, ly2 + 1), (0, 0, 0), -1)
+        cv2.rectangle(output, (lx1, ly1), (lx2, ly2), colour, -1)
+
+        # High contrast text color: black for bright backgrounds (Anomaly/Vehicle), white for others
+        text_color = (0, 0, 0) if label in ('Anomaly', 'Vehicle') else (255, 255, 255)
+
+        text_y = ly1 + th + 4
+        cv2.putText(
+            output, text,
+            (lx1 + 2, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+            text_color, thickness, cv2.LINE_AA
+        )
 
     return output, num_humans, num_drones, num_vehicles, num_weapons
 
@@ -642,31 +648,98 @@ def create_overlay(original, heatmap, alpha=0.5):
     return overlay
 
 
-def create_anomaly_mask(scores, threshold_percentile=95):
-    """Create binary mask of anomaly regions."""
-    threshold = np.percentile(scores, threshold_percentile)
-    mask = (scores >= threshold).astype(np.uint8) * 255
-    return mask, threshold
+def create_anomaly_mask(scores, threshold_percentile=95, detections=None, min_contour_area=150):
+    """
+    Create binary mask of genuine anomaly regions, eliminating false background detections.
+    
+    Parameters:
+        scores               : 2D numpy array of anomaly scores
+        threshold_percentile : percentile threshold (slider value: 80 to 99.5)
+        detections           : list of confirmed YOLO detections, if any
+        min_contour_area     : minimum pixel area for a region to be considered a real anomaly
+    """
+    h, w = scores.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    score_mean = float(np.mean(scores))
+    score_std = float(np.std(scores))
+    score_max = float(np.max(scores))
+
+    # ── 1. If YOLO detected verified targets (e.g. Car, Human, Drone, Vehicle) ──
+    if detections:
+        for det in detections:
+            x1, y1, x2, y2 = det['box']
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w - 1, x2), min(h - 1, y2)
+            if x2 > x1 and y2 > y1:
+                # Mask inside the bounding box
+                box_scores = scores[y1:y2, x1:x2]
+                box_med = np.median(box_scores)
+                # Take pixels that are foreground inside the target box
+                target_mask = (box_scores >= box_med * 0.5).astype(np.uint8) * 255
+                mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], target_mask)
+
+        # Background outlier check: ONLY include non-target regions if they are
+        # extreme statistical outliers (score > mean + 4.5 * std)
+        if score_std > 1e-6:
+            strict_thresh = score_mean + 4.5 * score_std
+            bg_outliers = (scores >= strict_thresh).astype(np.uint8) * 255
+            k_small = np.ones((5, 5), np.uint8)
+            bg_outliers = cv2.morphologyEx(bg_outliers, cv2.MORPH_OPEN, k_small)
+            mask = np.maximum(mask, bg_outliers)
+
+    # ── 2. If NO YOLO detections (pure statistical / hyperspectral detection) ──
+    else:
+        # Scale k from 2.0 to 4.0 based on threshold slider (80 to 99.5)
+        k_factor = 2.0 + max(0.0, min(1.0, (threshold_percentile - 80.0) / 19.5)) * 2.0
+        stat_threshold = score_mean + k_factor * score_std
+        percentile_threshold = np.percentile(scores, threshold_percentile)
+
+        # Stricter threshold prevents marking 5% of uniform background as anomalies
+        adaptive_threshold = max(stat_threshold, percentile_threshold)
+
+        # Only activate mask if there is a significant outlier in the image
+        if score_max > score_mean + 1.8 * score_std:
+            mask = (scores >= adaptive_threshold).astype(np.uint8) * 255
+        else:
+            mask = np.zeros((h, w), dtype=np.uint8)
+
+    # ── 3. Morphological closing to connect full object bodies (e.g. pen, pencil) ──
+    kernel = np.ones((9, 9), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # ── 4. Filter out small noisy speckles by contour area ─────────────────────
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    clean_mask = np.zeros_like(mask)
+    for c in contours:
+        if cv2.contourArea(c) >= min_contour_area:
+            cv2.drawContours(clean_mask, [c], -1, 255, -1)
+
+    # Smooth boundary dilation
+    clean_mask = cv2.dilate(clean_mask, np.ones((5, 5), np.uint8), iterations=1)
+
+    effective_thresh_val = float(np.percentile(scores, threshold_percentile))
+    return clean_mask, effective_thresh_val
 
 
 def create_highlighted_output(original, mask):
-    """Create output with anomaly regions highlighted with contours."""
+    """Create output with anomaly regions highlighted with smooth contours."""
     if len(original.shape) == 2:
         output = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
     else:
         output = original.copy()
-    
-    # Find contours of anomaly regions
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Draw contours with a bright color
-    cv2.drawContours(output, contours, -1, (0, 0, 255), 2)
-    
-    # Create semi-transparent red overlay on anomaly areas
-    red_overlay = output.copy()
-    red_overlay[mask > 0] = [0, 0, 255]
-    output = cv2.addWeighted(output, 0.7, red_overlay, 0.3, 0)
-    
+
+    if contours:
+        # Draw clean red boundary contour around genuine anomalies
+        cv2.drawContours(output, contours, -1, (0, 0, 255), 2, cv2.LINE_AA)
+
+        # Semi-transparent red overlay on anomaly areas
+        red_overlay = output.copy()
+        red_overlay[mask > 0] = [0, 0, 255]
+        output = cv2.addWeighted(output, 0.75, red_overlay, 0.25, 0)
+
     return output, len(contours)
 
 
@@ -675,17 +748,21 @@ def create_highlighted_output(original, mask):
 def extract_rgb_features(image, block_size=1):
     """
     Extract multi-dimensional features from an RGB image.
-    Features include: R, G, B channels, intensity, local contrast, and texture.
+    Features include: LAB color channels (for better color isolation), intensity, and texture.
     """
     if len(image.shape) == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     
     h, w = image.shape[:2]
     
-    # Color features (normalized)
-    img_float = image.astype(np.float64) / 255.0
-    b_chan, g_chan, r_chan = img_float[:, :, 0], img_float[:, :, 1], img_float[:, :, 2]
+    # Color features (LAB is much better for distinguishing unique colors like blue/yellow)
+    lab_img = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float64) / 255.0
+    l_chan, a_chan, b_chan = lab_img[:, :, 0], lab_img[:, :, 1], lab_img[:, :, 2]
     
+    # RGB color features (normalized)
+    img_float = image.astype(np.float64) / 255.0
+    b_rgb, g_rgb, r_rgb = img_float[:, :, 0], img_float[:, :, 1], img_float[:, :, 2]
+
     # Intensity
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64) / 255.0
     
@@ -704,8 +781,12 @@ def extract_rgb_features(image, block_size=1):
     gradient_mag = np.sqrt(sobelx**2 + sobely**2)
     gradient_mag = gradient_mag / gradient_mag.max() if gradient_mag.max() > 0 else gradient_mag
     
-    # Stack all features
-    features = np.stack([r_chan, g_chan, b_chan, gray, local_contrast, lbp_normalized, gradient_mag], axis=-1)
+    # Stack all features - emphasize LAB color space by multiplying a and b channels slightly
+    features = np.stack([
+        r_rgb, g_rgb, b_rgb, 
+        l_chan, a_chan * 1.5, b_chan * 1.5, 
+        gray, local_contrast, lbp_normalized, gradient_mag
+    ], axis=-1)
     
     return features
 
@@ -737,6 +818,26 @@ def detect_anomalies_rgb(image, method='mahalanobis'):
         scores_stat = _mahalanobis_anomaly(pixels, h, w)
     elif method == 'statistical':
         scores_stat = _statistical_anomaly(pixels, h, w, features)
+    elif method == 'local_target':
+        # Local difference method specifically for finding small targets 
+        # (like cars on a road) while ignoring large uniform areas (like the road itself)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Median blur removes small objects (like the car) but preserves large features (road)
+        # Using a large kernel ensures the car is completely erased in the background
+        bg_median = cv2.medianBlur(gray, 41)
+        
+        # The difference highlights exactly what was removed (the car)
+        diff = cv2.absdiff(gray, bg_median).astype(np.float64)
+        
+        # Suppress noise in highly textured areas (like the forest) using the gradient
+        sobelx = cv2.Sobel(bg_median, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(bg_median, cv2.CV_64F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(sobelx**2 + sobely**2)
+        grad_mag = cv2.GaussianBlur(grad_mag, (15, 15), 0)
+        
+        # Penalize difference in areas of high background texture
+        scores_stat = diff / (1.0 + grad_mag * 0.1)
     else:
         scores_stat = _mahalanobis_anomaly(pixels, h, w)
     
@@ -1113,9 +1214,9 @@ def detect_anomalies():
                 return jsonify({'error': 'Failed to read image. Please upload a valid RGB image.'}), 400
             
             # Resize if too large (for performance and memory)
-            # Render free tier has 512MB RAM – keep image small enough
-            # for YOLO + MinCovDet to fit within memory budget.
-            max_dim = int(os.environ.get('MAX_DETECTION_DIM', '480'))
+            # Default to 1280 to preserve enough detail for aerial/drone imagery 
+            # where targets are small.
+            max_dim = int(os.environ.get('MAX_DETECTION_DIM', '1280'))
             h, w = image.shape[:2]
             if max(h, w) > max_dim:
                 scale = max_dim / max(h, w)
@@ -1125,29 +1226,15 @@ def detect_anomalies():
             # ── Primary + secondary detection (YOLO + statistical) ──────────
             scores, detections = detect_anomalies_rgb(image, method=method)
             
-            # ── Threshold: if YOLO found targets, lower threshold so targets
-            #    always appear as anomaly regions even at default settings ────
-            effective_threshold = threshold_percentile
-            if detections:
-                # With fused scores the target regions are at 3× max,
-                # so any percentile ≤ 99.5 will include them.
-                effective_threshold = min(threshold_percentile, 97.0)
-            
             # Generate visualizations
             heatmap = create_heatmap(scores)
             overlay = create_overlay(image, heatmap, alpha=0.45)
-            mask, threshold_value = create_anomaly_mask(scores, effective_threshold)
+            # Create mask isolating real anomalies (passing detections so background road/desk is excluded)
+            mask, threshold_value = create_anomaly_mask(scores, threshold_percentile, detections=detections)
 
             # Draw bounding boxes + labels on the highlighted image
             annotated_image, num_humans, num_drones, num_vehicles, num_weapons = draw_detection_boxes(image, detections)
-            highlighted_yolo, num_regions_yolo = create_highlighted_output(annotated_image, mask)
-
-            # Also keep a pure statistical highlighted (no boxes) for comparison
-            highlighted_stat, num_regions_stat = create_highlighted_output(image, mask)
-
-            # Primary highlighted output = YOLO-annotated version
-            highlighted  = highlighted_yolo
-            num_regions  = num_regions_yolo if detections else num_regions_stat
+            highlighted, num_regions = create_highlighted_output(annotated_image, mask)
             
             # Statistics
             total_pixels = h * w
@@ -1159,7 +1246,7 @@ def detect_anomalies():
                 'anomaly_pixels': anomaly_pixels,
                 'anomaly_percentage': round(anomaly_percentage, 2),
                 'num_regions': num_regions,
-                'threshold_percentile': effective_threshold,
+                'threshold_percentile': threshold_percentile,
                 'threshold_value': float(threshold_value),
                 'min_score': float(np.min(scores)),
                 'max_score': float(np.max(scores)),
