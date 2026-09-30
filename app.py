@@ -761,4 +761,4 @@ if __name__ == '__main__':
     print("=" * 60)
     print(f"  Server: http://localhost:{port}")
     print("=" * 60)
-    app.run(debug=debug, host='0.0.0.0', port=port)
+    app.run(debug=debug, host='0.0.0.0', port=port, use_reloader=False)
