@@ -84,7 +84,7 @@ fileRemove.addEventListener('click', (e) => {
 
 function handleFileSelect(file) {
     const ext = file.name.split('.').pop().toLowerCase();
-    const validExtensions = ['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif', 'npy', 'hdr', 'mat'];
+    const validExtensions = ['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif', 'webp', 'npy', 'hdr', 'mat'];
     
     if (!validExtensions.includes(ext)) {
         showToast('Unsupported file format. Use PNG, JPG, TIFF, NPY, or HDR.', 'error');

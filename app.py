@@ -38,20 +38,30 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-# ─── YOLOv8 Target Detector (Humans & Drones) ────────────────────────────────
+# ─── YOLOv8 Target Detector (Humans, Drones & Vehicles) ─────────────────────
 
 # COCO class IDs that represent our real anomaly targets
-# 0  = person (human)
+# 0  = person  (human)
+# 2  = car     } 
+# 3  = motorcycle } vehicle group
+# 5  = bus     }
+# 7  = truck   }
 # 4  = airplane (fixed-wing UAV proxy)
 # 14 = bird    (small UAV / quadcopter proxy – often confused with drones in COCO)
-# We ALSO use confidence + aspect-ratio heuristics to distinguish true drones.
-YOLO_HUMAN_CLASS_ID  = 0          # person
-YOLO_DRONE_CLASS_IDS = {4, 14}    # airplane, bird – drone proxies in COCO
+YOLO_HUMAN_CLASS_ID   = 0            # person
+YOLO_DRONE_CLASS_IDS  = {4, 14}      # airplane, bird – drone proxies in COCO
+YOLO_VEHICLE_CLASS_IDS = {2, 3, 5, 7} # car, motorcycle, bus, truck
+
+# All target class IDs combined
+YOLO_ALL_TARGET_IDS = (
+    {YOLO_HUMAN_CLASS_ID} | YOLO_DRONE_CLASS_IDS | YOLO_VEHICLE_CLASS_IDS
+)
 
 # Colour palette for bounding-box rendering (BGR)
-COLOUR_HUMAN  = (0,   0,   255)   # Red   – human
-COLOUR_DRONE  = (0, 165,   255)   # Orange – drone
-COLOUR_BORDER = (255, 255, 255)   # White  – label border
+COLOUR_HUMAN   = (0,   0,   255)   # Red    – human
+COLOUR_DRONE   = (0, 165,   255)   # Orange – drone
+COLOUR_VEHICLE = (255, 200,   0)   # Cyan   – vehicle
+COLOUR_BORDER  = (255, 255, 255)   # White  – label border
 
 _yolo_model = None   # lazy-loaded singleton
 
@@ -73,16 +83,25 @@ def _get_yolo_model():
 
 def detect_targets_yolo(image_bgr, conf_threshold=0.25):
     """
-    Run YOLOv8 on the image and return detections for humans and drones.
+    Run YOLOv8 on the image and return detections for humans, drones, and vehicles.
 
     Returns a list of dicts:
         {
-            'label'  : 'Human' | 'Drone',
-            'conf'   : float,
-            'box'    : (x1, y1, x2, y2),   # absolute pixel coords
+            'label'   : 'Human' | 'Drone' | 'Vehicle',
+            'sublabel': e.g. 'Car', 'Truck', 'Drone', 'Human'
+            'conf'    : float,
+            'box'     : (x1, y1, x2, y2),   # absolute pixel coords
             'class_id': int
         }
     """
+    # COCO class name mapping for vehicle subtypes
+    VEHICLE_SUBTYPE = {
+        2: 'Car',
+        3: 'Motorcycle',
+        5: 'Bus',
+        7: 'Truck',
+    }
+
     model = _get_yolo_model()
     if model is None:
         return []
@@ -92,7 +111,7 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.25):
             image_bgr,
             conf=conf_threshold,
             verbose=False,
-            classes=list({YOLO_HUMAN_CLASS_ID} | YOLO_DRONE_CLASS_IDS)
+            classes=list(YOLO_ALL_TARGET_IDS)
         )
     except Exception as e:
         print(f"[YOLO] Inference error: {e}")
@@ -108,21 +127,27 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.25):
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
             if cls_id == YOLO_HUMAN_CLASS_ID:
-                label = 'Human'
+                label    = 'Human'
+                sublabel = 'Human'
             elif cls_id in YOLO_DRONE_CLASS_IDS:
-                label = 'Drone'
+                label    = 'Drone'
+                sublabel = 'Drone'
+            elif cls_id in YOLO_VEHICLE_CLASS_IDS:
+                label    = 'Vehicle'
+                sublabel = VEHICLE_SUBTYPE.get(cls_id, 'Vehicle')
             else:
                 continue
 
             detections.append({
                 'label'   : label,
+                'sublabel': sublabel,
                 'conf'    : conf,
                 'box'     : (x1, y1, x2, y2),
                 'class_id': cls_id,
             })
 
     print(f"[YOLO] Found {len(detections)} target(s): "
-          f"{[d['label'] for d in detections]}")
+          f"{[d['sublabel'] for d in detections]}")
     return detections
 
 
@@ -160,28 +185,35 @@ def build_detection_score_map(scores_stat, detections, image_shape):
 def draw_detection_boxes(image_bgr, detections):
     """
     Render coloured bounding boxes + confidence labels on the image.
-    Returns (annotated_image, num_humans, num_drones).
+    Colours: Red = Human | Orange = Drone | Cyan = Vehicle
+    Returns (annotated_image, num_humans, num_drones, num_vehicles).
     """
     output = image_bgr.copy()
-    num_humans = 0
-    num_drones = 0
+    num_humans   = 0
+    num_drones   = 0
+    num_vehicles = 0
 
     for det in detections:
         x1, y1, x2, y2 = det['box']
-        label  = det['label']
-        conf   = det['conf']
-        colour = COLOUR_HUMAN if label == 'Human' else COLOUR_DRONE
+        label    = det['label']
+        sublabel = det.get('sublabel', label)
+        conf     = det['conf']
 
         if label == 'Human':
+            colour = COLOUR_HUMAN
             num_humans += 1
-        else:
+        elif label == 'Drone':
+            colour = COLOUR_DRONE
             num_drones += 1
+        else:  # Vehicle
+            colour = COLOUR_VEHICLE
+            num_vehicles += 1
 
         # Thick bounding box
         cv2.rectangle(output, (x1, y1), (x2, y2), colour, 3)
 
-        # Label background pill
-        text = f"{label} {conf:.0%}"
+        # Label text: show sublabel (e.g. "Car", "Truck") + confidence
+        text = f"{sublabel} {conf:.0%}"
         (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         label_y1 = max(y1 - th - baseline - 6, 0)
         label_y2 = max(y1, th + baseline + 6)
@@ -200,7 +232,7 @@ def draw_detection_boxes(image_bgr, detections):
         cv2.rectangle(overlay, (x1, y1), (x2, y2), colour, -1)
         cv2.addWeighted(overlay, 0.15, output, 0.85, 0, output)
 
-    return output, num_humans, num_drones
+    return output, num_humans, num_drones, num_vehicles
 
 # ─── App Configuration ───────────────────────────────────────────────────────
 
@@ -216,7 +248,7 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['RESULTS_FOLDER'] = RESULTS_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
 
-ALLOWED_RGB_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif'}
+ALLOWED_RGB_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif', 'webp'}
 ALLOWED_HYPER_EXTENSIONS = {'hdr', 'npy', 'mat', 'tif', 'tiff'}
 
 
@@ -592,6 +624,7 @@ def generate_pdf_report(result_data, result_id):
         ['Detected Regions', str(stats.get('num_regions', 'N/A'))],
         ['Humans Detected', str(stats.get('num_humans_detected', 'N/A'))],
         ['Drones Detected', str(stats.get('num_drones_detected', 'N/A'))],
+        ['Vehicles Detected', str(stats.get('num_vehicles_detected', 'N/A'))],
         ['Threshold Percentile', f"{stats.get('threshold_percentile', 'N/A')}%"],
         ['Min Anomaly Score', f"{stats.get('min_score', 0):.4f}"],
         ['Max Anomaly Score', f"{stats.get('max_score', 0):.4f}"],
@@ -643,10 +676,12 @@ def generate_pdf_report(result_data, result_id):
             )
         method_text = (
             "This analysis uses a two-layer detection pipeline for identifying REAL anomalies "
-            "(humans and drones) in the scene. "
-            "PRIMARY LAYER: YOLOv8 nano object detection is applied to locate persons (humans) "
-            "and UAVs/drones (mapped via COCO airplane and bird class proxies). Detected targets "
-            "receive the maximum anomaly score, ensuring they always appear as hot zones in the heatmap. "
+            "(humans, drones, and vehicles) in the scene. "
+            "PRIMARY LAYER: YOLOv8 nano object detection is applied to locate: "
+            "(1) Persons/humans, (2) UAVs/drones (via COCO airplane and bird class proxies), "
+            "(3) Vehicles including cars, motorcycles, buses and trucks. "
+            "Detected targets receive the maximum anomaly score, ensuring they always appear "
+            "as hot zones in the heatmap. "
             "SECONDARY LAYER: Mahalanobis distance statistical anomaly detection is applied "
             "using Minimum Covariance Determinant robust covariance estimation on multi-dimensional "
             "pixel features (RGB channels, intensity, local contrast, LBP texture, gradient magnitude). "
@@ -667,9 +702,9 @@ def generate_pdf_report(result_data, result_id):
     # Disclaimer
     elements.append(Paragraph("Disclaimer", heading_style))
     disclaimer_text = (
-        "This system is designed to detect HUMANS and DRONES as primary anomaly targets using YOLOv8 "
-        "object detection, supplemented by statistical background anomaly scoring. "
-        "Bounding boxes shown in RED indicate detected humans; ORANGE indicates detected drones. "
+        "This system is designed to detect HUMANS, DRONES, and VEHICLES as primary anomaly targets "
+        "using YOLOv8 object detection, supplemented by statistical background anomaly scoring. "
+        "Bounding boxes: RED = Human | ORANGE = Drone | CYAN = Vehicle (Car/Truck/Bus/Motorcycle). "
         "Results should be verified by domain experts. Detection accuracy depends on "
         "image quality, lighting conditions, target size, and occlusion."
     )
@@ -751,7 +786,7 @@ def detect_anomalies():
             mask, threshold_value = create_anomaly_mask(scores, effective_threshold)
 
             # Draw bounding boxes + labels on the highlighted image
-            annotated_image, num_humans, num_drones = draw_detection_boxes(image, detections)
+            annotated_image, num_humans, num_drones, num_vehicles = draw_detection_boxes(image, detections)
             highlighted_yolo, num_regions_yolo = create_highlighted_output(annotated_image, mask)
 
             # Also keep a pure statistical highlighted (no boxes) for comparison
@@ -778,13 +813,15 @@ def detect_anomalies():
                 'mean_score': float(np.mean(scores)),
                 'std_score': float(np.std(scores)),
                 # YOLO-specific counts
-                'num_humans_detected': num_humans,
-                'num_drones_detected': num_drones,
+                'num_humans_detected'  : num_humans,
+                'num_drones_detected'  : num_drones,
+                'num_vehicles_detected': num_vehicles,
                 'yolo_detections': [
                     {
-                        'label': d['label'],
+                        'label'     : d['label'],
+                        'sublabel'  : d.get('sublabel', d['label']),
                         'confidence': round(d['conf'], 3),
-                        'bbox': list(d['box']),
+                        'bbox'      : list(d['box']),
                     }
                     for d in detections
                 ],
