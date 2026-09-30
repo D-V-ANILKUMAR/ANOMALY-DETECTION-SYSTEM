@@ -68,14 +68,16 @@ _weapon_model      = None   # lazy-loaded weapon-detection model singleton
 
 
 def _get_yolo_model():
-    """Lazy-load YOLOv8s (COCO) model once and cache it."""
+    """Lazy-load YOLOv8n (COCO) model once and cache it."""
     global _yolo_model
     if _yolo_model is None:
         try:
             # pyrefly: ignore [missing-import]
             from ultralytics import YOLO
-            _yolo_model = YOLO('yolov8s.pt')   # small model – better accuracy for distant/small objects
-            print("[YOLO] YOLOv8s model loaded successfully.")
+            # Use nano model on deployment – 4x less RAM than 'small',
+            # still accurate for humans, vehicles, drones at imgsz=640
+            _yolo_model = YOLO('yolov8n.pt')
+            print("[YOLO] YOLOv8n model loaded successfully.")
         except Exception as e:
             print(f"[YOLO] Could not load YOLOv8 model: {e}. Falling back to statistical detection.")
             _yolo_model = False   # sentinel – don't retry
@@ -260,12 +262,20 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
     t_h = upper_h
     t_w = upper_w // 2 + upper_w // 8
 
-    zoom_tiles = [
+    # On low-memory deployments (e.g. Render free 512MB), skip Phase-2 zoom
+    # tiles to avoid OOM. Each tile = 1 full YOLO forward pass = ~200MB spike.
+    # Set DISABLE_PHASE2=1 in Render env vars to activate this.
+    _disable_phase2 = os.environ.get('DISABLE_PHASE2', '0') == '1'
+
+    zoom_tiles = [] if _disable_phase2 else [
         (0,               0, t_w,      t_h),   # upper-left
         (upper_w - t_w,   0, upper_w, t_h),    # upper-right
         ((upper_w - t_w) // 2, 0,
          (upper_w - t_w) // 2 + t_w, t_h),    # centre
     ]
+    if _disable_phase2:
+        print("[YOLO] Phase-2 zoom tiles DISABLED (low-memory mode)")
+
 
     # Collect all Phase-2 raw detections, tracking how many tiles each came from
     # phase2_raw entries: dict with detection fields + 'tile_count'
@@ -303,28 +313,30 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
 
     # Pass B – super-zoom background strip (top 35% of image, upscaled 3×)
     # This gives ~3× resolution boost on distant objects like cars / tiny people.
-    bg_h = int(h * 0.35)
-    bg_strip = image_bgr[0:bg_h, :]
-    if bg_strip.size > 0:
-        zoom_factor = 3
-        bg_zoom = cv2.resize(
-            bg_strip,
-            (bg_strip.shape[1] * zoom_factor, bg_strip.shape[0] * zoom_factor),
-            interpolation=cv2.INTER_LANCZOS4
-        )
-        bg_dets_raw = _run_yolo(bg_zoom, ox=0, oy=0, conf=0.10)
-        # Remap from zoomed coords back to full-image coords
-        for det in bg_dets_raw:
-            x1z, y1z, x2z, y2z = det['box']
-            det['box'] = (
-                x1z // zoom_factor,
-                y1z // zoom_factor,
-                x2z // zoom_factor,
-                y2z // zoom_factor,
+    # Skipped in low-memory mode (DISABLE_PHASE2=1)
+    if not _disable_phase2:
+        bg_h = int(h * 0.35)
+        bg_strip = image_bgr[0:bg_h, :]
+        if bg_strip.size > 0:
+            zoom_factor = 3
+            bg_zoom = cv2.resize(
+                bg_strip,
+                (bg_strip.shape[1] * zoom_factor, bg_strip.shape[0] * zoom_factor),
+                interpolation=cv2.INTER_LANCZOS4
             )
-            print(f"[YOLO] BG-strip cls={det['class_id']}({det['sublabel']}) "
-                  f"conf={det['conf']:.3f} box={det['box']}")
-            _merge_raw(det, phase2_raw)
+            bg_dets_raw = _run_yolo(bg_zoom, ox=0, oy=0, conf=0.10)
+            # Remap from zoomed coords back to full-image coords
+            for det in bg_dets_raw:
+                x1z, y1z, x2z, y2z = det['box']
+                det['box'] = (
+                    x1z // zoom_factor,
+                    y1z // zoom_factor,
+                    x2z // zoom_factor,
+                    y2z // zoom_factor,
+                )
+                print(f"[YOLO] BG-strip cls={det['class_id']}({det['sublabel']}) "
+                      f"conf={det['conf']:.3f} box={det['box']}")
+                _merge_raw(det, phase2_raw)
 
     # ── Filter and deduplicate Phase-2 candidates ─────────────────────────────
     # Accept a detection if:
@@ -1101,8 +1113,9 @@ def detect_anomalies():
                 return jsonify({'error': 'Failed to read image. Please upload a valid RGB image.'}), 400
             
             # Resize if too large (for performance and memory)
-            # Use 640 so YOLO also runs at decent resolution
-            max_dim = 640
+            # Render free tier has 512MB RAM – keep image small enough
+            # for YOLO + MinCovDet to fit within memory budget.
+            max_dim = int(os.environ.get('MAX_DETECTION_DIM', '480'))
             h, w = image.shape[:2]
             if max(h, w) > max_dim:
                 scale = max_dim / max(h, w)

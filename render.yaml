@@ -5,7 +5,7 @@ services:
     repo: https://github.com/D-V-ANILKUMAR/ANOMALY-DETECTION-SYSTEM.git
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300
     plan: free
     envVars:
       - key: PYTHON_VERSION
@@ -17,8 +17,12 @@ services:
       - key: MAX_UPLOAD_SIZE_MB
         value: "50"
       - key: WORKERS
-        value: "2"
+        value: "1"
       - key: TIMEOUT
-        value: "120"
+        value: "300"
       - key: MPLBACKEND
         value: Agg
+      - key: DISABLE_PHASE2
+        value: "1"
+      - key: MAX_DETECTION_DIM
+        value: "480"
