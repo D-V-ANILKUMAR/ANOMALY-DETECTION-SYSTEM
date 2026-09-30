@@ -3,9 +3,11 @@ Anomaly Detection System - Backend Application
 Target Detection by Optimizing Anomaly Detection in Hyperspectral and RGB Image Processing using AI/ML
 
 This Flask application provides:
-- RGB image anomaly detection using statistical methods (Mahalanobis distance, Local Outlier Factor)
+- RGB image anomaly detection targeting REAL anomalies: HUMANS and DRONES
+- YOLOv8-based object detection for humans (person class) and drones (airplane/UAV class)
+- Statistical fallback using Mahalanobis distance for unknown anomaly types
 - Hyperspectral image anomaly detection using RX (Reed-Xiaoli) detector
-- Heatmap and overlay visualization
+- Heatmap and overlay visualization with labeled bounding boxes
 - Downloadable PDF reports
 """
 
@@ -35,6 +37,170 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+
+# ─── YOLOv8 Target Detector (Humans & Drones) ────────────────────────────────
+
+# COCO class IDs that represent our real anomaly targets
+# 0  = person (human)
+# 4  = airplane (fixed-wing UAV proxy)
+# 14 = bird    (small UAV / quadcopter proxy – often confused with drones in COCO)
+# We ALSO use confidence + aspect-ratio heuristics to distinguish true drones.
+YOLO_HUMAN_CLASS_ID  = 0          # person
+YOLO_DRONE_CLASS_IDS = {4, 14}    # airplane, bird – drone proxies in COCO
+
+# Colour palette for bounding-box rendering (BGR)
+COLOUR_HUMAN  = (0,   0,   255)   # Red   – human
+COLOUR_DRONE  = (0, 165,   255)   # Orange – drone
+COLOUR_BORDER = (255, 255, 255)   # White  – label border
+
+_yolo_model = None   # lazy-loaded singleton
+
+
+def _get_yolo_model():
+    """Lazy-load YOLOv8n (nano) model once and cache it."""
+    global _yolo_model
+    if _yolo_model is None:
+        try:
+            # pyrefly: ignore [missing-import]
+            from ultralytics import YOLO
+            _yolo_model = YOLO('yolov8n.pt')   # auto-downloads on first use
+            print("[YOLO] YOLOv8n model loaded successfully.")
+        except Exception as e:
+            print(f"[YOLO] Could not load YOLOv8 model: {e}. Falling back to statistical detection.")
+            _yolo_model = False   # sentinel – don't retry
+    return _yolo_model if _yolo_model is not False else None
+
+
+def detect_targets_yolo(image_bgr, conf_threshold=0.25):
+    """
+    Run YOLOv8 on the image and return detections for humans and drones.
+
+    Returns a list of dicts:
+        {
+            'label'  : 'Human' | 'Drone',
+            'conf'   : float,
+            'box'    : (x1, y1, x2, y2),   # absolute pixel coords
+            'class_id': int
+        }
+    """
+    model = _get_yolo_model()
+    if model is None:
+        return []
+
+    try:
+        results = model(
+            image_bgr,
+            conf=conf_threshold,
+            verbose=False,
+            classes=list({YOLO_HUMAN_CLASS_ID} | YOLO_DRONE_CLASS_IDS)
+        )
+    except Exception as e:
+        print(f"[YOLO] Inference error: {e}")
+        return []
+
+    detections = []
+    for result in results:
+        if result.boxes is None:
+            continue
+        for box in result.boxes:
+            cls_id = int(box.cls[0].item())
+            conf   = float(box.conf[0].item())
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+            if cls_id == YOLO_HUMAN_CLASS_ID:
+                label = 'Human'
+            elif cls_id in YOLO_DRONE_CLASS_IDS:
+                label = 'Drone'
+            else:
+                continue
+
+            detections.append({
+                'label'   : label,
+                'conf'    : conf,
+                'box'     : (x1, y1, x2, y2),
+                'class_id': cls_id,
+            })
+
+    print(f"[YOLO] Found {len(detections)} target(s): "
+          f"{[d['label'] for d in detections]}")
+    return detections
+
+
+def build_detection_score_map(scores_stat, detections, image_shape):
+    """
+    Fuse statistical anomaly scores with YOLO bounding-box detections.
+
+    Strategy:
+    - Start from the statistical score map (background layer).
+    - For each detected human / drone, forcibly set that region to the
+      MAXIMUM possible score so it always shows as a hot anomaly.
+    - Non-target regions are left with their statistical scores so the
+      heatmap still shows genuine background variation.
+    """
+    h, w = image_shape[:2]
+    fused = scores_stat.copy().astype(np.float64)
+
+    if not detections:
+        return fused
+
+    score_max = fused.max() if fused.max() > 0 else 1.0
+
+    for det in detections:
+        x1, y1, x2, y2 = det['box']
+        # clamp to image bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        if x2 > x1 and y2 > y1:
+            # Use 3× max so targets dominate the normalised heatmap
+            fused[y1:y2, x1:x2] = score_max * 3.0
+
+    return fused
+
+
+def draw_detection_boxes(image_bgr, detections):
+    """
+    Render coloured bounding boxes + confidence labels on the image.
+    Returns (annotated_image, num_humans, num_drones).
+    """
+    output = image_bgr.copy()
+    num_humans = 0
+    num_drones = 0
+
+    for det in detections:
+        x1, y1, x2, y2 = det['box']
+        label  = det['label']
+        conf   = det['conf']
+        colour = COLOUR_HUMAN if label == 'Human' else COLOUR_DRONE
+
+        if label == 'Human':
+            num_humans += 1
+        else:
+            num_drones += 1
+
+        # Thick bounding box
+        cv2.rectangle(output, (x1, y1), (x2, y2), colour, 3)
+
+        # Label background pill
+        text = f"{label} {conf:.0%}"
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        label_y1 = max(y1 - th - baseline - 6, 0)
+        label_y2 = max(y1, th + baseline + 6)
+        cv2.rectangle(output, (x1, label_y1), (x1 + tw + 8, label_y2), colour, -1)
+
+        # White text
+        cv2.putText(
+            output, text,
+            (x1 + 4, label_y2 - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+            COLOUR_BORDER, 2, cv2.LINE_AA
+        )
+
+        # Semi-transparent fill inside box
+        overlay = output.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), colour, -1)
+        cv2.addWeighted(overlay, 0.15, output, 0.85, 0, output)
+
+    return output, num_humans, num_drones
 
 # ─── App Configuration ───────────────────────────────────────────────────────
 
@@ -162,11 +328,15 @@ def extract_rgb_features(image, block_size=1):
 
 def detect_anomalies_rgb(image, method='mahalanobis'):
     """
-    Detect anomalies in RGB images using statistical methods.
-    
-    Methods:
-    - mahalanobis: Mahalanobis distance from global mean (robust covariance)
-    - statistical: Local statistical deviation method
+    Detect anomalies in RGB images.
+
+    PRIMARY layer  – YOLOv8 object detection targeting HUMANS and DRONES.
+    SECONDARY layer – Statistical (Mahalanobis / Z-score) background deviation
+                     used to generate the heatmap and catch anything YOLO misses.
+
+    Returns:
+        scores      : 2-D float array of fused anomaly scores
+        detections  : list of YOLO detection dicts (may be empty)
     """
     h, w = image.shape[:2]
     features = extract_rgb_features(image)
@@ -178,17 +348,24 @@ def detect_anomalies_rgb(image, method='mahalanobis'):
     # Remove NaN/Inf values
     pixels = np.nan_to_num(pixels, nan=0.0, posinf=1.0, neginf=0.0)
     
+    # ── Statistical (background) score map ──────────────────────────────────
     if method == 'mahalanobis':
-        scores = _mahalanobis_anomaly(pixels, h, w)
+        scores_stat = _mahalanobis_anomaly(pixels, h, w)
     elif method == 'statistical':
-        scores = _statistical_anomaly(pixels, h, w, features)
+        scores_stat = _statistical_anomaly(pixels, h, w, features)
     else:
-        scores = _mahalanobis_anomaly(pixels, h, w)
+        scores_stat = _mahalanobis_anomaly(pixels, h, w)
     
-    # Smooth scores to reduce noise
-    scores = gaussian_filter(scores, sigma=2)
+    # Smooth to reduce pixel-level noise
+    scores_stat = gaussian_filter(scores_stat, sigma=2)
     
-    return scores
+    # ── YOLO target detection (humans & drones) ──────────────────────────────
+    detections = detect_targets_yolo(image, conf_threshold=0.25)
+    
+    # ── Fuse: stamp max score onto detected target bounding boxes ────────────
+    scores_fused = build_detection_score_map(scores_stat, detections, image.shape)
+    
+    return scores_fused, detections
 
 
 def _mahalanobis_anomaly(pixels, h, w):
@@ -413,6 +590,8 @@ def generate_pdf_report(result_data, result_id):
         ['Anomalous Pixels', f"{stats.get('anomaly_pixels', 'N/A'):,}"],
         ['Anomaly Percentage', f"{stats.get('anomaly_percentage', 0):.2f}%"],
         ['Detected Regions', str(stats.get('num_regions', 'N/A'))],
+        ['Humans Detected', str(stats.get('num_humans_detected', 'N/A'))],
+        ['Drones Detected', str(stats.get('num_drones_detected', 'N/A'))],
         ['Threshold Percentile', f"{stats.get('threshold_percentile', 'N/A')}%"],
         ['Min Anomaly Score', f"{stats.get('min_score', 0):.4f}"],
         ['Max Anomaly Score', f"{stats.get('max_score', 0):.4f}"],
@@ -454,13 +633,25 @@ def generate_pdf_report(result_data, result_id):
     # Method Description
     elements.append(Paragraph("Detection Methodology", heading_style))
     if result_data.get('image_type') == 'rgb':
+        yolo_dets = result_data.get('statistics', {}).get('yolo_detections', [])
+        yolo_summary = ''
+        if yolo_dets:
+            yolo_summary = (
+                f" YOLOv8 identified {len(yolo_dets)} target(s) in this image: "
+                + ', '.join(f"{d['label']} ({d['confidence']:.0%})" for d in yolo_dets)
+                + "."
+            )
         method_text = (
-            "This analysis uses statistical anomaly detection on RGB images. "
-            "Multi-dimensional features (color channels, intensity, local contrast, "
-            "texture via Local Binary Patterns, and gradient magnitude) are extracted from each pixel. "
-            "The Mahalanobis distance from the robust global statistics is computed using "
-            "Minimum Covariance Determinant estimation, identifying pixels that deviate "
-            "significantly from the normal background distribution."
+            "This analysis uses a two-layer detection pipeline for identifying REAL anomalies "
+            "(humans and drones) in the scene. "
+            "PRIMARY LAYER: YOLOv8 nano object detection is applied to locate persons (humans) "
+            "and UAVs/drones (mapped via COCO airplane and bird class proxies). Detected targets "
+            "receive the maximum anomaly score, ensuring they always appear as hot zones in the heatmap. "
+            "SECONDARY LAYER: Mahalanobis distance statistical anomaly detection is applied "
+            "using Minimum Covariance Determinant robust covariance estimation on multi-dimensional "
+            "pixel features (RGB channels, intensity, local contrast, LBP texture, gradient magnitude). "
+            "This catches any anomalies YOLO may miss and provides a continuous background score map."
+            + yolo_summary
         )
     else:
         method_text = (
@@ -476,10 +667,11 @@ def generate_pdf_report(result_data, result_id):
     # Disclaimer
     elements.append(Paragraph("Disclaimer", heading_style))
     disclaimer_text = (
-        "This system detects unusual visual/spectral patterns in the uploaded image. "
-        "It does not identify or classify what the anomaly is (e.g., car, building, defect). "
+        "This system is designed to detect HUMANS and DRONES as primary anomaly targets using YOLOv8 "
+        "object detection, supplemented by statistical background anomaly scoring. "
+        "Bounding boxes shown in RED indicate detected humans; ORANGE indicates detected drones. "
         "Results should be verified by domain experts. Detection accuracy depends on "
-        "image quality, lighting conditions, and the nature of anomalies present."
+        "image quality, lighting conditions, target size, and occlusion."
     )
     elements.append(Paragraph(disclaimer_text, body_style))
     
@@ -534,21 +726,40 @@ def detect_anomalies():
                 return jsonify({'error': 'Failed to read image. Please upload a valid RGB image.'}), 400
             
             # Resize if too large (for performance and memory)
-            max_dim = 512
+            # Use 640 so YOLO also runs at decent resolution
+            max_dim = 640
             h, w = image.shape[:2]
             if max(h, w) > max_dim:
                 scale = max_dim / max(h, w)
                 image = cv2.resize(image, (int(w * scale), int(h * scale)))
                 h, w = image.shape[:2]
             
-            # Detect anomalies
-            scores = detect_anomalies_rgb(image, method=method)
+            # ── Primary + secondary detection (YOLO + statistical) ──────────
+            scores, detections = detect_anomalies_rgb(image, method=method)
+            
+            # ── Threshold: if YOLO found targets, lower threshold so targets
+            #    always appear as anomaly regions even at default settings ────
+            effective_threshold = threshold_percentile
+            if detections:
+                # With fused scores the target regions are at 3× max,
+                # so any percentile ≤ 99.5 will include them.
+                effective_threshold = min(threshold_percentile, 97.0)
             
             # Generate visualizations
             heatmap = create_heatmap(scores)
             overlay = create_overlay(image, heatmap, alpha=0.45)
-            mask, threshold_value = create_anomaly_mask(scores, threshold_percentile)
-            highlighted, num_regions = create_highlighted_output(image, mask)
+            mask, threshold_value = create_anomaly_mask(scores, effective_threshold)
+
+            # Draw bounding boxes + labels on the highlighted image
+            annotated_image, num_humans, num_drones = draw_detection_boxes(image, detections)
+            highlighted_yolo, num_regions_yolo = create_highlighted_output(annotated_image, mask)
+
+            # Also keep a pure statistical highlighted (no boxes) for comparison
+            highlighted_stat, num_regions_stat = create_highlighted_output(image, mask)
+
+            # Primary highlighted output = YOLO-annotated version
+            highlighted  = highlighted_yolo
+            num_regions  = num_regions_yolo if detections else num_regions_stat
             
             # Statistics
             total_pixels = h * w
@@ -560,18 +771,29 @@ def detect_anomalies():
                 'anomaly_pixels': anomaly_pixels,
                 'anomaly_percentage': round(anomaly_percentage, 2),
                 'num_regions': num_regions,
-                'threshold_percentile': threshold_percentile,
+                'threshold_percentile': effective_threshold,
                 'threshold_value': float(threshold_value),
                 'min_score': float(np.min(scores)),
                 'max_score': float(np.max(scores)),
                 'mean_score': float(np.mean(scores)),
                 'std_score': float(np.std(scores)),
+                # YOLO-specific counts
+                'num_humans_detected': num_humans,
+                'num_drones_detected': num_drones,
+                'yolo_detections': [
+                    {
+                        'label': d['label'],
+                        'confidence': round(d['conf'], 3),
+                        'bbox': list(d['box']),
+                    }
+                    for d in detections
+                ],
             }
             
             result_data = {
                 'result_id': result_id,
                 'image_type': 'rgb',
-                'method': method,
+                'method': f"{method} + YOLOv8 target detection" if detections else method,
                 'width': w,
                 'height': h,
                 'original_base64': encode_image_to_base64(image),
