@@ -84,72 +84,33 @@ def _get_yolo_model():
 
 def _get_weapon_model():
     """
-    Lazy-load a weapon-detection YOLO model.
+    Lazy-load a weapon-detection YOLO model – tries ONCE, fails fast.
 
-    Priority:
-      1. Local 'weapon.pt' in the same directory (user-supplied or previously cached)
-      2. Hugging Face Hub: keremberke/yolov8n-weapon-detection (via huggingface_hub)
-      3. Direct URL download to local cache
-    Falls back to None so the system still works without weapon detection.
+    Only checks for local 'weapon.pt'.  Remote downloads are skipped entirely
+    because the HuggingFace repo is gated (401) and the download hangs every
+    request for 30-60 s, causing page timeouts.
+
+    To enable weapon model: place 'weapon.pt' next to app.py manually.
     """
     global _weapon_model
     if _weapon_model is None:
-        from ultralytics import YOLO
         import os
-
         local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weapon.pt')
-
-        # 1 – use locally cached file if already downloaded
         if os.path.exists(local_path):
             try:
+                from ultralytics import YOLO
                 _weapon_model = YOLO(local_path)
                 print("[WEAPON] Local weapon.pt loaded successfully.")
-                return _weapon_model
             except Exception as e:
-                print(f"[WEAPON] Local weapon.pt failed: {e}")
-
-        # 2 – download from GitHub releases (direct .pt download, no HF auth needed)
-        WEAPON_URL = (
-            "https://github.com/ultralytics/assets/releases/download/v0.0.0/"
-            "yolov8n.pt"   # placeholder – replaced below
-        )
-        # Use the keremberke model hosted on HuggingFace via requests
-        HF_URL = (
-            "https://huggingface.co/keremberke/yolov8n-weapon-detection"
-            "/resolve/main/best.pt"
-        )
-        try:
-            import requests, shutil
-            print("[WEAPON] Downloading weapon detection model…")
-            r = requests.get(HF_URL, stream=True, timeout=60)
-            r.raise_for_status()
-            with open(local_path, 'wb') as f:
-                shutil.copyfileobj(r.raw, f)
-            _weapon_model = YOLO(local_path)
-            print("[WEAPON] Weapon model downloaded and loaded successfully.")
-            return _weapon_model
-        except Exception as e:
-            print(f"[WEAPON] HuggingFace download failed: {e}")
-
-        # 3 – try HuggingFace Hub Python package
-        try:
-            from huggingface_hub import hf_hub_download
-            cached = hf_hub_download(
-                repo_id="keremberke/yolov8n-weapon-detection",
-                filename="best.pt",
-                local_dir=os.path.dirname(local_path),
-                local_dir_use_symlinks=False,
-            )
-            _weapon_model = YOLO(cached)
-            print("[WEAPON] Weapon model loaded via huggingface_hub.")
-            return _weapon_model
-        except Exception as e:
-            print(f"[WEAPON] huggingface_hub fallback failed: {e}")
-
-        print("[WEAPON] All weapon model sources failed. Weapons will not be detected.")
-        _weapon_model = False
-
+                print(f"[WEAPON] Local weapon.pt failed to load: {e}")
+                _weapon_model = False
+        else:
+            # No local model — skip silently, heuristic handles weapon detection
+            print("[WEAPON] No local weapon.pt found. Heuristic-only weapon detection active.")
+            _weapon_model = False
     return _weapon_model if _weapon_model is not False else None
+
+
 
 
 
