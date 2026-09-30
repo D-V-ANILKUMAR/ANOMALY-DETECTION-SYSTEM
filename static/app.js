@@ -220,18 +220,26 @@ async function runDetection() {
             body: formData,
         });
         
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || 'Detection failed');
+        // Read body text once (can only be consumed once per response)
+        const responseText = await response.text();
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (_) {
+            // Server returned HTML (Render wake-up page / 502 / 504)
+            if (!response.ok) {
+                throw new Error(
+                    `Server returned HTTP ${response.status}. ` +
+                    `If this is the first request after a while, Render free tier may be waking up. ` +
+                    `Please wait 30 seconds and try again.`
+                );
+            }
+            throw new Error('Server returned an unexpected response. Please try again.');
         }
         
-        // Step 4: Visualize
-        setProgressStep('visualize');
-        processingText.textContent = 'Generating visualizations...';
-        await sleep(300);
-        
-        const data = await response.json();
-        state.resultData = data;
+        if (!response.ok) {
+            throw new Error(data.error || `Detection failed (HTTP ${response.status})`);
+        }
         
         // Step 5: Complete
         setProgressStep('complete');
@@ -351,13 +359,19 @@ $('#adjustThresholdBtn').addEventListener('click', async () => {
             body: JSON.stringify({ result_id: resultId, threshold: threshold }),
         });
         
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || 'Re-threshold failed');
+        const responseText = await response.text();
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (_) {
+            throw new Error('Server returned an unexpected response. Please try again.');
         }
         
-        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || 'Re-threshold failed');
+        }
         
+
         // Update visualizations
         setImage('imgHeatmap', data.heatmap_base64);
         setImage('imgOverlay', data.overlay_base64);
