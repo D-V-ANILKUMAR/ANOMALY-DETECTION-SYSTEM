@@ -5,7 +5,7 @@ services:
     repo: https://github.com/D-V-ANILKUMAR/ANOMALY-DETECTION-SYSTEM.git
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     plan: free
     envVars:
       - key: PYTHON_VERSION
