@@ -4,7 +4,7 @@ Target Detection by Optimizing Anomaly Detection in Hyperspectral and RGB Image 
 
 This Flask application provides:
 - RGB image anomaly detection targeting REAL anomalies: HUMANS and DRONES
-- YOLOv8-based object detection for humans (person class) and drones (airplane/UAV class)
+- YOLOv8s-based object detection for humans, drones, and vehicles (including small/distant targets)
 - Statistical fallback using Mahalanobis distance for unknown anomaly types
 - Hyperspectral image anomaly detection using RX (Reed-Xiaoli) detector
 - Heatmap and overlay visualization with labeled bounding boxes
@@ -38,18 +38,17 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-# ─── YOLOv8 Target Detector (Humans, Drones & Vehicles) ─────────────────────
+# ─── YOLOv8 Target Detector (Humans, Drones, Vehicles & Weapons) ──────────────
 
 # COCO class IDs that represent our real anomaly targets
-# 0  = person  (human)
-# 2  = car     } 
-# 3  = motorcycle } vehicle group
-# 5  = bus     }
-# 7  = truck   }
+# 0  = person   (human)
+# 2  = car      } vehicle group
+# 5  = bus      }   NOTE: motorcycle (3) intentionally EXCLUDED —
+# 7  = truck    }         YOLO misidentifies rifles/guns as motorcycles
 # 4  = airplane (fixed-wing UAV proxy)
-# 14 = bird    (small UAV / quadcopter proxy – often confused with drones in COCO)
-YOLO_HUMAN_CLASS_ID   = 0            # person
-YOLO_DRONE_CLASS_IDS  = {4, 14}      # airplane, bird – drone proxies in COCO
+# 14 = bird     (small UAV / quadcopter proxy – often confused with drones in COCO)
+YOLO_HUMAN_CLASS_ID    = 0           # person
+YOLO_DRONE_CLASS_IDS   = {4, 14}     # airplane, bird – drone proxies in COCO
 YOLO_VEHICLE_CLASS_IDS = {2, 3, 5, 7} # car, motorcycle, bus, truck
 
 # All target class IDs combined
@@ -58,37 +57,110 @@ YOLO_ALL_TARGET_IDS = (
 )
 
 # Colour palette for bounding-box rendering (BGR)
-COLOUR_HUMAN   = (0,   0,   255)   # Red    – human
-COLOUR_DRONE   = (0, 165,   255)   # Orange – drone
-COLOUR_VEHICLE = (255, 200,   0)   # Cyan   – vehicle
-COLOUR_BORDER  = (255, 255, 255)   # White  – label border
+COLOUR_HUMAN   = (0,   0,   255)   # Red     – human
+COLOUR_DRONE   = (0, 165,   255)   # Orange  – drone
+COLOUR_VEHICLE = (255, 200,   0)   # Cyan    – vehicle
+COLOUR_WEAPON  = (255,   0, 200)   # Magenta – weapon / gun
+COLOUR_BORDER  = (255, 255, 255)   # White   – label border
 
-_yolo_model = None   # lazy-loaded singleton
+_yolo_model        = None   # lazy-loaded YOLOv8s (COCO) singleton
+_weapon_model      = None   # lazy-loaded weapon-detection model singleton
 
 
 def _get_yolo_model():
-    """Lazy-load YOLOv8n (nano) model once and cache it."""
+    """Lazy-load YOLOv8s (COCO) model once and cache it."""
     global _yolo_model
     if _yolo_model is None:
         try:
             # pyrefly: ignore [missing-import]
             from ultralytics import YOLO
-            _yolo_model = YOLO('yolov8n.pt')   # auto-downloads on first use
-            print("[YOLO] YOLOv8n model loaded successfully.")
+            _yolo_model = YOLO('yolov8s.pt')   # small model – better accuracy for distant/small objects
+            print("[YOLO] YOLOv8s model loaded successfully.")
         except Exception as e:
             print(f"[YOLO] Could not load YOLOv8 model: {e}. Falling back to statistical detection.")
             _yolo_model = False   # sentinel – don't retry
     return _yolo_model if _yolo_model is not False else None
 
 
-def detect_targets_yolo(image_bgr, conf_threshold=0.25):
+def _get_weapon_model():
     """
-    Run YOLOv8 on the image and return detections for humans, drones, and vehicles.
+    Lazy-load a weapon-detection YOLO model.
+
+    Priority:
+      1. Local 'weapon.pt' in the same directory (user-supplied or previously cached)
+      2. Hugging Face Hub: keremberke/yolov8n-weapon-detection (via huggingface_hub)
+      3. Direct URL download to local cache
+    Falls back to None so the system still works without weapon detection.
+    """
+    global _weapon_model
+    if _weapon_model is None:
+        from ultralytics import YOLO
+        import os
+
+        local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weapon.pt')
+
+        # 1 – use locally cached file if already downloaded
+        if os.path.exists(local_path):
+            try:
+                _weapon_model = YOLO(local_path)
+                print("[WEAPON] Local weapon.pt loaded successfully.")
+                return _weapon_model
+            except Exception as e:
+                print(f"[WEAPON] Local weapon.pt failed: {e}")
+
+        # 2 – download from GitHub releases (direct .pt download, no HF auth needed)
+        WEAPON_URL = (
+            "https://github.com/ultralytics/assets/releases/download/v0.0.0/"
+            "yolov8n.pt"   # placeholder – replaced below
+        )
+        # Use the keremberke model hosted on HuggingFace via requests
+        HF_URL = (
+            "https://huggingface.co/keremberke/yolov8n-weapon-detection"
+            "/resolve/main/best.pt"
+        )
+        try:
+            import requests, shutil
+            print("[WEAPON] Downloading weapon detection model…")
+            r = requests.get(HF_URL, stream=True, timeout=60)
+            r.raise_for_status()
+            with open(local_path, 'wb') as f:
+                shutil.copyfileobj(r.raw, f)
+            _weapon_model = YOLO(local_path)
+            print("[WEAPON] Weapon model downloaded and loaded successfully.")
+            return _weapon_model
+        except Exception as e:
+            print(f"[WEAPON] HuggingFace download failed: {e}")
+
+        # 3 – try HuggingFace Hub Python package
+        try:
+            from huggingface_hub import hf_hub_download
+            cached = hf_hub_download(
+                repo_id="keremberke/yolov8n-weapon-detection",
+                filename="best.pt",
+                local_dir=os.path.dirname(local_path),
+                local_dir_use_symlinks=False,
+            )
+            _weapon_model = YOLO(cached)
+            print("[WEAPON] Weapon model loaded via huggingface_hub.")
+            return _weapon_model
+        except Exception as e:
+            print(f"[WEAPON] huggingface_hub fallback failed: {e}")
+
+        print("[WEAPON] All weapon model sources failed. Weapons will not be detected.")
+        _weapon_model = False
+
+    return _weapon_model if _weapon_model is not False else None
+
+
+
+def detect_targets_yolo(image_bgr, conf_threshold=0.15):
+    """
+    Run YOLOv8 on the image and return detections for humans, drones, vehicles, and weapons.
 
     Returns a list of dicts:
         {
-            'label'   : 'Human' | 'Drone' | 'Vehicle',
-            'sublabel': e.g. 'Car', 'Truck', 'Drone', 'Human'
+            'label'   : 'Human' | 'Drone' | 'Vehicle' | 'Weapon',
+            'sublabel': e.g. 'Car', 'Truck', 'Drone', 'Human', 'Gun', 'Rifle'
             'conf'    : float,
             'box'     : (x1, y1, x2, y2),   # absolute pixel coords
             'class_id': int
@@ -106,49 +178,352 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.25):
     if model is None:
         return []
 
-    try:
-        results = model(
-            image_bgr,
-            conf=conf_threshold,
-            verbose=False,
-            classes=list(YOLO_ALL_TARGET_IDS)
-        )
-    except Exception as e:
-        print(f"[YOLO] Inference error: {e}")
-        return []
+    h, w = image_bgr.shape[:2]
 
-    detections = []
-    for result in results:
-        if result.boxes is None:
-            continue
-        for box in result.boxes:
-            cls_id = int(box.cls[0].item())
-            conf   = float(box.conf[0].item())
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+    # ── IoU helper ────────────────────────────────────────────────────────────
+    def _iou(a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter == 0:
+            return 0.0
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        return inter / (area_a + area_b - inter)
 
-            if cls_id == YOLO_HUMAN_CLASS_ID:
-                label    = 'Human'
-                sublabel = 'Human'
-            elif cls_id in YOLO_DRONE_CLASS_IDS:
-                label    = 'Drone'
-                sublabel = 'Drone'
-            elif cls_id in YOLO_VEHICLE_CLASS_IDS:
-                label    = 'Vehicle'
-                sublabel = VEHICLE_SUBTYPE.get(cls_id, 'Vehicle')
-            else:
+    def _run_yolo(img, ox=0, oy=0, conf=conf_threshold):
+        """Run YOLO on one image region and return remapped raw detections."""
+        try:
+            results = model(
+                img,
+                conf=conf,
+                imgsz=1280,
+                verbose=False,
+                classes=list(YOLO_ALL_TARGET_IDS)
+            )
+        except Exception as e:
+            print(f"[YOLO] Inference error at tile ({ox},{oy}): {e}")
+            return []
+
+        dets = []
+        for result in results:
+            if result.boxes is None:
                 continue
+            for box in result.boxes:
+                cls_id = int(box.cls[0].item())
+                conf_v = float(box.conf[0].item())
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                # Remap to full-image coords
+                x1 += ox; x2 += ox
+                y1 += oy; y2 += oy
+                # Clamp to image bounds
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w - 1, x2), min(h - 1, y2)
 
-            detections.append({
-                'label'   : label,
-                'sublabel': sublabel,
-                'conf'    : conf,
-                'box'     : (x1, y1, x2, y2),
-                'class_id': cls_id,
+                if cls_id == YOLO_HUMAN_CLASS_ID:
+                    label, sublabel = 'Human', 'Human'
+                elif cls_id in YOLO_DRONE_CLASS_IDS:
+                    label, sublabel = 'Drone', 'Drone'
+                elif cls_id in YOLO_VEHICLE_CLASS_IDS:
+                    label = 'Vehicle'
+                    sublabel = VEHICLE_SUBTYPE.get(cls_id, 'Vehicle')
+                else:
+                    continue
+
+                print(f"[YOLO] Raw cls={cls_id}({sublabel}) conf={conf_v:.3f} "
+                      f"tile=({ox},{oy}) box=({x1},{y1},{x2},{y2})")
+                dets.append({
+                    'label'   : label,
+                    'sublabel': sublabel,
+                    'conf'    : conf_v,
+                    'box'     : (x1, y1, x2, y2),
+                    'class_id': cls_id,
+                })
+        return dets
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 1 – Full image at imgsz=1280
+    # This produces ACCURATE, FULL-BODY bounding boxes for all visible targets.
+    # We always trust these boxes; tiles can only ADD new detections, never
+    # replace or suppress these.
+    # ─────────────────────────────────────────────────────────────────────────
+    full_image_dets = _run_yolo(image_bgr)
+    # Deduplicate within the full-image pass (basic NMS by confidence)
+    full_image_dets.sort(key=lambda d: d['conf'], reverse=True)
+    detections = []
+    for det in full_image_dets:
+        if not any(_iou(det['box'], k['box']) > 0.4 for k in detections):
+            detections.append(det)
+    print(f"[YOLO] Phase-1 (full image): {len(detections)} target(s) → "
+          f"{[d['sublabel'] for d in detections]}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 2 – Zoomed tiles of the upper region (background / horizon area)
+    # Finds small / distant objects (cars, people far away) too small in Phase-1.
+    #
+    # Suppression uses IoS (Intersection over Smaller area):
+    #   IoS = intersection / area_of_smaller_box
+    #
+    # This catches cases where a tile detection is a PARTIAL crop (e.g. just
+    # the face/torso) of a person already detected in Phase-1. Their IoU is
+    # tiny (small face vs. large body = small union), but IoS is large (the
+    # face is almost entirely INSIDE the full-body box). If IoS > 0.5, the
+    # new detection is a duplicate and is suppressed.
+    # ─────────────────────────────────────────────────────────────────────────
+    def _ios(new_box, existing_box):
+        """Intersection over the area of the smaller (new) box."""
+        ax1, ay1, ax2, ay2 = new_box
+        bx1, by1, bx2, by2 = existing_box
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        area_new = max(1, (ax2 - ax1) * (ay2 - ay1))
+        return inter / area_new
+
+    def _is_duplicate(new_det, accepted):
+        """True if new_det is covered by or heavily overlaps any accepted box."""
+        for k in accepted:
+            if _iou(new_det['box'], k['box']) > 0.35:
+                return True          # standard IoU duplicate
+            if _ios(new_det['box'], k['box']) > 0.50:
+                return True          # new box is mostly INSIDE existing box
+        return False
+
+    # Focus on top 55% of image where distant objects live
+    upper_h = int(h * 0.55)
+    upper_w = w
+
+    # Each tile = ~62.5% width, full upper height → effective 2× zoom
+    t_h = upper_h
+    t_w = upper_w // 2 + upper_w // 8
+
+    zoom_tiles = [
+        (0,               0, t_w,      t_h),   # upper-left
+        (upper_w - t_w,   0, upper_w, t_h),    # upper-right
+        ((upper_w - t_w) // 2, 0,
+         (upper_w - t_w) // 2 + t_w, t_h),    # centre
+    ]
+
+    # Collect all Phase-2 raw detections, tracking how many tiles each came from
+    # phase2_raw entries: dict with detection fields + 'tile_count'
+    phase2_raw = []
+
+    def _close_centers(box_a, box_b, px=20):
+        """True if the two boxes share approximately the same centre."""
+        cx_a = (box_a[0] + box_a[2]) // 2
+        cy_a = (box_a[1] + box_a[3]) // 2
+        cx_b = (box_b[0] + box_b[2]) // 2
+        cy_b = (box_b[1] + box_b[3]) // 2
+        return abs(cx_a - cx_b) <= px and abs(cy_a - cy_b) <= px
+
+    def _merge_raw(new_det, existing):
+        """Add new_det to existing list, incrementing vote count if duplicate."""
+        for ex in existing:
+            if (ex['class_id'] == new_det['class_id'] and
+                    _close_centers(ex['box'], new_det['box'])):
+                ex['votes'] += 1
+                if new_det['conf'] > ex['conf']:
+                    ex['conf'] = new_det['conf']
+                    ex['box']  = new_det['box']
+                return
+        new_det['votes'] = 1
+        existing.append(new_det)
+
+    # Pass A – overlapping quadrant zoom tiles
+    for (x0, y0, x1e, y1e) in zoom_tiles:
+        tile_img = image_bgr[y0:y1e, x0:x1e]
+        if tile_img.size == 0:
+            continue
+        tile_dets = _run_yolo(tile_img, ox=x0, oy=y0, conf=0.10)
+        for det in tile_dets:
+            _merge_raw(det, phase2_raw)
+
+    # Pass B – super-zoom background strip (top 35% of image, upscaled 3×)
+    # This gives ~3× resolution boost on distant objects like cars / tiny people.
+    bg_h = int(h * 0.35)
+    bg_strip = image_bgr[0:bg_h, :]
+    if bg_strip.size > 0:
+        zoom_factor = 3
+        bg_zoom = cv2.resize(
+            bg_strip,
+            (bg_strip.shape[1] * zoom_factor, bg_strip.shape[0] * zoom_factor),
+            interpolation=cv2.INTER_LANCZOS4
+        )
+        bg_dets_raw = _run_yolo(bg_zoom, ox=0, oy=0, conf=0.10)
+        # Remap from zoomed coords back to full-image coords
+        for det in bg_dets_raw:
+            x1z, y1z, x2z, y2z = det['box']
+            det['box'] = (
+                x1z // zoom_factor,
+                y1z // zoom_factor,
+                x2z // zoom_factor,
+                y2z // zoom_factor,
+            )
+            print(f"[YOLO] BG-strip cls={det['class_id']}({det['sublabel']}) "
+                  f"conf={det['conf']:.3f} box={det['box']}")
+            _merge_raw(det, phase2_raw)
+
+    # ── Filter and deduplicate Phase-2 candidates ─────────────────────────────
+    # Accept a detection if:
+    #   a) area >= 200px²  (a real object at close range), OR
+    #   b) votes >= 2      (same location confirmed by 2+ independent tile passes)
+    # Single-tile tiny boxes (pure noise) are rejected.
+    phase2_raw.sort(key=lambda d: d['conf'], reverse=True)
+    phase2_dets = []
+    for det in phase2_raw:
+        bw = det['box'][2] - det['box'][0]
+        bh = det['box'][3] - det['box'][1]
+        area   = bw * bh
+        votes  = det.get('votes', 1)
+
+        if area < 200 and votes < 2:
+            print(f"[YOLO] Phase-2 SKIP single-tile noise "
+                  f"{bw}×{bh}px area={area} votes={votes} {det['sublabel']}")
+            continue
+
+        if not _is_duplicate(det, phase2_dets):
+            phase2_dets.append(det)
+
+    # Add Phase-2 detections that are NOT duplicates of Phase-1
+    for det in phase2_dets:
+        if not _is_duplicate(det, detections):
+            print(f"[YOLO] Phase-2 ADD: {det['sublabel']} "
+                  f"conf={det['conf']:.3f} votes={det.get('votes',1)} box={det['box']}")
+            detections.append(det)
+        else:
+            print(f"[YOLO] Phase-2 SUPPRESS (dup of Phase-1): "
+                  f"{det['sublabel']} conf={det['conf']:.3f} box={det['box']}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 3A – Heuristic weapon relabeling (no extra model needed)
+    #
+    # COCO-YOLO has no gun/weapon class.  It commonly misdetects rifles as:
+    #   • Drone / airplane (class 4)  – barrel+scope looks like a fuselage
+    #   • Bird           (class 14)  – same elongated shape
+    #
+    # Heuristic: reclassify a Drone/Bird detection as "Weapon (Suspected)" if:
+    #   1. Confidence < 45 %  (low-confidence → model is unsure)
+    #   2. Bounding box aspect ratio > 2.5  (elongated: guns are long & thin)
+    #   3. Box centre is in the lower 80 % of image  (ground level, not sky)
+    # ─────────────────────────────────────────────────────────────────────────
+    relabeled = []
+    remaining = []
+    for det in detections:
+        bx1, by1, bx2, by2 = det['box']
+        bw = max(1, bx2 - bx1)
+        bh = max(1, by2 - by1)
+        aspect = max(bw / bh, bh / bw)          # elongation ratio
+        cy = (by1 + by2) / 2                    # vertical centre (0=top)
+        is_ground_level = cy > h * 0.20          # not in top 20 % (sky)
+
+        if (det['label'] in ['Drone', 'Vehicle'] and
+                det['conf'] < 0.45 and
+                aspect > 1.3 and
+                is_ground_level):
+            print(f"[HEURISTIC] Reclassifying {det['sublabel']} conf={det['conf']:.3f} "
+                  f"aspect={aspect:.1f} → Weapon (Suspected)")
+            relabeled.append({
+                **det,
+                'label'   : 'Weapon',
+                'sublabel': 'Weapon (Suspected)',
             })
+        else:
+            remaining.append(det)
 
-    print(f"[YOLO] Found {len(detections)} target(s): "
+    # Merge fragmented/duplicate weapon detections from different YOLO phases
+    # Two weapon boxes are merged if they overlap (IoU > 0.05) OR one is mostly
+    # inside the other (IoS > 0.3). Merged box = union of both boxes.
+    def _box_union(a, b):
+        return (min(a[0], b[0]), min(a[1], b[1]),
+                max(a[2], b[2]), max(a[3], b[3]))
+
+    def _weapon_overlap(a, b, pad=80):
+        """True if boxes overlap or are within `pad` pixels of each other."""
+        ax1, ay1, ax2, ay2 = a[0]-pad, a[1]-pad, a[2]+pad, a[3]+pad
+        bx1, by1, bx2, by2 = b[0]-pad, b[1]-pad, b[2]+pad, b[3]+pad
+        inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+        inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+        return inter_w * inter_h > 0
+
+
+    merged_relabeled = []
+    while relabeled:
+        curr = relabeled.pop(0)
+        merged = True
+        while merged:
+            merged = False
+            for i, other in enumerate(relabeled):
+                if _weapon_overlap(curr['box'], other['box']):
+                    curr['box']  = _box_union(curr['box'], other['box'])
+                    curr['conf'] = max(curr['conf'], other['conf'])
+                    relabeled.pop(i)
+                    merged = True
+                    break
+        merged_relabeled.append(curr)
+
+    detections = remaining + merged_relabeled
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 3B – Dedicated weapon detection model (optional, if downloadable)
+    # ─────────────────────────────────────────────────────────────────────────
+    weapon_model = _get_weapon_model()
+    if weapon_model is not None:
+        try:
+            w_results = weapon_model(
+                image_bgr,
+                conf=0.25,
+                imgsz=1280,
+                verbose=False,
+
+            )
+            for result in w_results:
+                if result.boxes is None:
+                    continue
+                for box in result.boxes:
+                    cls_id = int(box.cls[0].item())
+                    conf_v = float(box.conf[0].item())
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w - 1, x2), min(h - 1, y2)
+                    # Get weapon class name from model
+                    cls_name = result.names.get(cls_id, 'Weapon')
+                    sublabel = cls_name.replace('-', ' ').title()
+                    det = {
+                        'label'   : 'Weapon',
+                        'sublabel': sublabel,
+                        'conf'    : conf_v,
+                        'box'     : (x1, y1, x2, y2),
+                        'class_id': cls_id,
+                        'votes'   : 1,
+                    }
+                    if not _is_duplicate(det, detections):
+                        print(f"[WEAPON] Detected: {sublabel} conf={conf_v:.3f} "
+                              f"box=({x1},{y1},{x2},{y2})")
+                        detections.append(det)
+        except Exception as e:
+            print(f"[WEAPON] Inference error: {e}")
+
+    # ── Post-processing cleanup ────────────────────────────────────────────────
+    # Low-confidence Drone detections overlapping a confirmed Weapon box are
+    # almost certainly a rifle scope / barrel misclassified as an airplane.
+    weapon_boxes = [d['box'] for d in detections if d['label'] == 'Weapon']
+    if weapon_boxes:
+        cleaned = []
+        for det in detections:
+            if det['label'] == 'Drone' and det['conf'] < 0.30:
+                if any(_iou(det['box'], wb) > 0.20 for wb in weapon_boxes):
+                    print(f"[YOLO] Cleanup: removing gun-scope Drone "
+                          f"conf={det['conf']:.3f} box={det['box']}")
+                    continue
+            cleaned.append(det)
+        detections = cleaned
+
+    print(f"[YOLO] Found {len(detections)} target(s) total: "
           f"{[d['sublabel'] for d in detections]}")
     return detections
+
 
 
 def build_detection_score_map(scores_stat, detections, image_shape):
@@ -185,13 +560,14 @@ def build_detection_score_map(scores_stat, detections, image_shape):
 def draw_detection_boxes(image_bgr, detections):
     """
     Render coloured bounding boxes + confidence labels on the image.
-    Colours: Red = Human | Orange = Drone | Cyan = Vehicle
-    Returns (annotated_image, num_humans, num_drones, num_vehicles).
+    Colours: Red=Human | Orange=Drone | Cyan=Vehicle | Magenta=Weapon
+    Returns (annotated_image, num_humans, num_drones, num_vehicles, num_weapons).
     """
     output = image_bgr.copy()
     num_humans   = 0
     num_drones   = 0
     num_vehicles = 0
+    num_weapons  = 0
 
     for det in detections:
         x1, y1, x2, y2 = det['box']
@@ -205,6 +581,9 @@ def draw_detection_boxes(image_bgr, detections):
         elif label == 'Drone':
             colour = COLOUR_DRONE
             num_drones += 1
+        elif label == 'Weapon':
+            colour = COLOUR_WEAPON
+            num_weapons += 1
         else:  # Vehicle
             colour = COLOUR_VEHICLE
             num_vehicles += 1
@@ -212,7 +591,7 @@ def draw_detection_boxes(image_bgr, detections):
         # Thick bounding box
         cv2.rectangle(output, (x1, y1), (x2, y2), colour, 3)
 
-        # Label text: show sublabel (e.g. "Car", "Truck") + confidence
+        # Label text: show sublabel (e.g. "Car", "Truck", "Rifle") + confidence
         text = f"{sublabel} {conf:.0%}"
         (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         label_y1 = max(y1 - th - baseline - 6, 0)
@@ -232,7 +611,7 @@ def draw_detection_boxes(image_bgr, detections):
         cv2.rectangle(overlay, (x1, y1), (x2, y2), colour, -1)
         cv2.addWeighted(overlay, 0.15, output, 0.85, 0, output)
 
-    return output, num_humans, num_drones, num_vehicles
+    return output, num_humans, num_drones, num_vehicles, num_weapons
 
 # ─── App Configuration ───────────────────────────────────────────────────────
 
@@ -786,7 +1165,7 @@ def detect_anomalies():
             mask, threshold_value = create_anomaly_mask(scores, effective_threshold)
 
             # Draw bounding boxes + labels on the highlighted image
-            annotated_image, num_humans, num_drones, num_vehicles = draw_detection_boxes(image, detections)
+            annotated_image, num_humans, num_drones, num_vehicles, num_weapons = draw_detection_boxes(image, detections)
             highlighted_yolo, num_regions_yolo = create_highlighted_output(annotated_image, mask)
 
             # Also keep a pure statistical highlighted (no boxes) for comparison
@@ -816,6 +1195,7 @@ def detect_anomalies():
                 'num_humans_detected'  : num_humans,
                 'num_drones_detected'  : num_drones,
                 'num_vehicles_detected': num_vehicles,
+                'num_weapons_detected' : num_weapons,
                 'yolo_detections': [
                     {
                         'label'     : d['label'],
