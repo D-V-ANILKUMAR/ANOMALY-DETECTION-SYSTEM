@@ -160,7 +160,7 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
             results = model(
                 img,
                 conf=conf,
-                imgsz=1280,
+                imgsz=640,
                 verbose=False,
                 classes=list(YOLO_ALL_TARGET_IDS)
             )
@@ -205,7 +205,7 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
         return dets
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PHASE 1 – Full image at imgsz=1280
+    # PHASE 1 – Full image at imgsz=640
     # This produces ACCURATE, FULL-BODY bounding boxes for all visible targets.
     # We always trust these boxes; tiles can only ADD new detections, never
     # replace or suppress these.
@@ -435,7 +435,7 @@ def detect_targets_yolo(image_bgr, conf_threshold=0.15):
             w_results = weapon_model(
                 image_bgr,
                 conf=0.25,
-                imgsz=1280,
+                imgsz=640,
                 verbose=False,
 
             )
